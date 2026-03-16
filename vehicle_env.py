@@ -1,64 +1,107 @@
 ﻿import numpy as np
+
 import config
-import utils  # 当前未直接使用，保留
 
 
 class VehicleEnv:
-    def __init__(self):
+    """Single-scenario NR-V2X reselection environment.
+
+    Episode length is fixed to config.EPISODE_STEPS.
+    """
+
+    def __init__(self, scenario=None):
         self.action_space_n = config.ACTION_DIM
         self.state_dim = config.STATE_DIM
+
+        self.scenario_type = self._validate_scenario(scenario or config.SCENARIO)
+        self._apply_scenario_profile()
+
+        self.max_inter_relay_dist = max(
+            p["inter_relay_dist_m"] for p in config.SCENARIO_PROFILES.values()
+        )
+        self.max_speed = max(p["speed_mps"] for p in config.SCENARIO_PROFILES.values())
+
         self.last_rsrp = -80.0
-        self.scenario_type = 'Highway'
-
-        # 统计量
-        self.handover_count = 0
-        self.rlf_steps = 0
-        self.pingpong_count = 0
-        self.ttt_counter = 0
-        self.time_step = 0
-        self.last_ho_time = -999  # 用于判定乒乓切换的时间点
-        self.steps_since_last_ho = 0
-
         self.current_rsrp = self.last_rsrp
         self.ue_relative_x = 0.0
-        self.inter_relay_dist = 1200.0
-        self.shadowing_std = 4.0
-        self.ue_speed = 35.0
 
-    def reset(self, force_scenario=None):
-        self.handover_count = 0
-        self.rlf_steps = 0
-        self.pingpong_count = 0
         self.ttt_counter = 0
         self.time_step = 0
-        self.last_ho_time = -999
+        self.last_ho_time = -9999
         self.steps_since_last_ho = 0
 
-        # 随机场景或按指定场景重置
-        self.scenario_type = force_scenario if force_scenario else np.random.choice(['Highway', 'Urban'])
+        self.episode_stats = {}
 
-        if self.scenario_type == 'Highway':
-            self.inter_relay_dist, self.shadowing_std, self.ue_speed = 1200.0, 4.0, 35.0
-        else:
-            self.inter_relay_dist, self.shadowing_std, self.ue_speed = 350.0, 8.0, 5.0
+    def _validate_scenario(self, scenario):
+        if scenario not in config.SCENARIO_PROFILES:
+            raise ValueError(
+                f"Invalid scenario '{scenario}'. "
+                f"Use one of {list(config.SCENARIO_PROFILES.keys())}."
+            )
+        return scenario
 
-        self.ue_relative_x = np.random.uniform(0, 50)
+    def _apply_scenario_profile(self):
+        profile = config.SCENARIO_PROFILES[self.scenario_type]
+        self.inter_relay_dist = float(profile["inter_relay_dist_m"])
+        self.shadowing_std = float(profile["shadowing_std_db"])
+        self.ue_speed = float(profile["speed_mps"])
+
+    def reset(self, force_scenario=None):
+        if force_scenario is not None:
+            self.scenario_type = self._validate_scenario(force_scenario)
+            self._apply_scenario_profile()
+
+        self.ttt_counter = 0
+        self.time_step = 0
+        self.last_ho_time = -9999
+        self.steps_since_last_ho = 0
+
+        self.episode_stats = {
+            "ho_attempted": 0,
+            "ho_success": 0,
+            "ho_failed": 0,
+            "pingpong": 0,
+            "weak_signal_event": 0,
+        }
+
+        self.ue_relative_x = np.random.uniform(0.0, 50.0)
         self.current_rsrp = self._calculate_physics_rsrp(self.ue_relative_x)
         self.last_rsrp = self.current_rsrp
+
         return self._get_state()
 
     def _calculate_physics_rsrp(self, distance):
-        """严格遵循 3GPP TR 38.901 的路径损耗建模。"""
         d = max(1.0, distance)
         fc = config.FC
-        if self.scenario_type == 'Urban':
-            path_loss = 35.3 + 31.9 * np.log10(d) + 20 * np.log10(fc)
+
+        if self.scenario_type == "Urban":
+            path_loss = 35.3 + 31.9 * np.log10(d) + 20.0 * np.log10(fc)
         else:
-            path_loss = 32.4 + 21.0 * np.log10(d) + 20 * np.log10(fc)
-        noise = np.random.normal(0, self.shadowing_std)
+            path_loss = 32.4 + 21.0 * np.log10(d) + 20.0 * np.log10(fc)
+
+        noise = np.random.normal(0.0, self.shadowing_std)
         return config.TX_POWER_DBM - path_loss + noise
 
+    def _episode_kpi(self):
+        attempts = max(self.episode_stats["ho_attempted"], 1)
+        hfr = self.episode_stats["ho_failed"] / attempts
+        ppr = self.episode_stats["pingpong"] / attempts
+        ehr = 1.0 - hfr - ppr
+        return {
+            "hfr": float(hfr),
+            "ppr": float(ppr),
+            "ehr": float(ehr),
+        }
+
+    def get_episode_stats(self):
+        stats = dict(self.episode_stats)
+        stats.update(self._episode_kpi())
+        return stats
+
     def step(self, action_index):
+        if action_index < 0 or action_index >= self.action_space_n:
+            raise ValueError(f"Invalid action_index: {action_index}")
+
         selected_threshold = config.ACTION_THRESHOLDS[action_index]
         self.ue_relative_x += self.ue_speed * config.SIM_STEP_SECONDS
 
@@ -66,7 +109,6 @@ class VehicleEnv:
         dist_target = abs(self.inter_relay_dist - self.ue_relative_x)
         rsrp_target = self._calculate_physics_rsrp(dist_target)
 
-        # 3GPP TTT 触发逻辑
         trigger_reselection = False
         if rsrp_serving < selected_threshold:
             self.ttt_counter += 1
@@ -78,103 +120,112 @@ class VehicleEnv:
                 trigger_reselection = True
 
         ho_attempted = 1 if trigger_reselection else 0
-        handover_occurred, handover_failed, is_pingpong = False, False, 0
+        ho_success = 0
+        ho_failed = 0
+        pingpong = 0
 
         if trigger_reselection:
-            if rsrp_target < -105:
-                handover_failed = True
+            if rsrp_target < config.TARGET_RSRP_FAIL_THRESHOLD_DBM:
+                ho_failed = 1
             else:
-                # 乒乓判定：1秒内再次切换
-                if self.time_step - self.last_ho_time < 10:
-                    is_pingpong = 1
-                    self.pingpong_count += 1
+                ho_success = 1
+
+                if (self.time_step - self.last_ho_time) < config.PINGPONG_WINDOW_STEPS:
+                    pingpong = 1
 
                 self.last_ho_time = self.time_step
                 self.ue_relative_x = max(5.0, abs(self.inter_relay_dist - self.ue_relative_x))
                 rsrp_serving = self._calculate_physics_rsrp(self.ue_relative_x)
 
-                # 切换成功计数
-                self.handover_count += 1
-                handover_occurred = True
-
             self.ttt_counter = 0
 
-        if handover_occurred:
+        if ho_success:
             self.steps_since_last_ho = 0
         else:
             self.steps_since_last_ho += 1
 
-        # KPI 统计逻辑
-        # HFR 只统计真实切换失败
-        is_rlf = 1 if handover_failed else 0
-        # 弱信号单独统计（不计入 HFR）
-        is_weak_signal = 1 if rsrp_serving < -115 else 0
-        # 仅用于环境内部链路失败惩罚
-        is_link_fail = 1 if (is_weak_signal or handover_failed) else 0
-        if is_link_fail:
-            self.rlf_steps += 1
+        weak_signal_event = 1 if rsrp_serving < config.WEAK_SIGNAL_THRESHOLD_DBM else 0
 
-        # Reward 数值稳定化（不改变训练主流程与协议逻辑）
-        reward = 0.0
-        done = False
+        self.episode_stats["ho_attempted"] += ho_attempted
+        self.episode_stats["ho_success"] += ho_success
+        self.episode_stats["ho_failed"] += ho_failed
+        self.episode_stats["pingpong"] += pingpong
+        self.episode_stats["weak_signal_event"] += weak_signal_event
 
-        # 1) 信号质量奖励：RSRP 映射到 [0,1] 再缩放
-        if rsrp_serving > -115:
-            q_norm = (rsrp_serving + 115.0) / 25.0
-            q_norm = float(np.clip(q_norm, 0.0, 1.0))
-            reward += 5.0 * q_norm
+        q_norm = np.clip(
+            (rsrp_serving - config.WEAK_SIGNAL_THRESHOLD_DBM) / 25.0,
+            0.0,
+            1.0,
+        )
 
-        # 2) 断连惩罚：触发后终止 episode
-        if is_link_fail:
-            reward -= 200.0
-            done = True
+        reward = config.REWARD_QOS * float(q_norm)
+        reward -= config.REWARD_FAIL * ho_failed
 
-        # 3) 切换惩罚：含递增项并封顶
-        if handover_occurred:
-            nth = max(0, self.handover_count - 1)
-            ho_pen = 5.0 + 1.0 * min(nth, 10)
-            reward -= ho_pen
+        if ho_success:
+            n_ho_done = self.episode_stats["ho_success"]
+            ho_penalty = config.REWARD_HO_COST_BASE + config.REWARD_HO_COST_SCALE * min(
+                max(0, n_ho_done - 1),
+                config.REWARD_HO_COST_N_CAP,
+            )
+            reward -= ho_penalty
 
-        # 4) 乒乓额外惩罚
-        if is_pingpong:
-            reward -= 8.0
+        reward -= config.REWARD_PINGPONG * pingpong
+        reward -= config.REWARD_WEAK_SIGNAL * weak_signal_event
+        reward += config.REWARD_ALIVE
 
-        # 5) 存活奖励
-        if not done:
-            reward += 0.5
+        if (
+            rsrp_serving < config.STAGNATION_RSRP_THRESHOLD_DBM
+            and self.steps_since_last_ho > config.STAGNATION_START_STEPS
+        ):
+            stagnation_term = (self.steps_since_last_ho - config.STAGNATION_START_STEPS) / max(
+                1.0,
+                config.STAGNATION_NORMALIZER,
+            )
+            reward -= config.REWARD_STAGNATION * min(stagnation_term, 1.0)
 
-        # 6) 长期不切换惩罚：仅在弱覆盖区（RSRP<-100 dBm）触发
-        if (not done) and (rsrp_serving < -100) and (self.steps_since_last_ho > 80):
-            stagnation_pen = 0.1 * (self.steps_since_last_ho - 80) / 100.0
-            reward -= min(stagnation_pen, 1.0)
-
-        # episode 终止条件
         self.current_rsrp = rsrp_serving
         self.time_step += 1
-        if self.ue_relative_x > (self.inter_relay_dist + 200) or self.time_step > 500:
-            done = True
 
-        return self._get_state(), reward, done, {
-            'rsrp': rsrp_serving,
-            'is_rlf': is_rlf,
-            'is_weak_signal': is_weak_signal,
-            'is_pingpong': is_pingpong,
-            'ho_attempted': ho_attempted,
-            'ho_happened': 1 if handover_occurred else 0,
-            'ttt': self.ttt_counter
+        done = self.time_step >= config.EPISODE_STEPS
+
+        info = {
+            "scenario": self.scenario_type,
+            "step": self.time_step,
+            "threshold_dbm": selected_threshold,
+            "rsrp": float(rsrp_serving),
+            "target_rsrp": float(rsrp_target),
+            "ho_attempted": ho_attempted,
+            "ho_success": ho_success,
+            "ho_failed": ho_failed,
+            "pingpong": pingpong,
+            "weak_signal_event": weak_signal_event,
+            "episode_ho_attempted": self.episode_stats["ho_attempted"],
+            "episode_ho_success": self.episode_stats["ho_success"],
+            "episode_ho_failed": self.episode_stats["ho_failed"],
+            "episode_pingpong": self.episode_stats["pingpong"],
+            "episode_weak_signal_event": self.episode_stats["weak_signal_event"],
         }
+        info.update(self._episode_kpi())
+
+        return self._get_state(), float(reward), done, info
 
     def _get_state(self):
         delta = self.current_rsrp - self.last_rsrp
         self.last_rsrp = self.current_rsrp
 
-        rsrp_norm = (self.current_rsrp + 115.0) / 25.0
-        rsrp_norm = float(np.clip(rsrp_norm, 0.0, 1.0))
+        rsrp_norm = np.clip(
+            (self.current_rsrp - config.WEAK_SIGNAL_THRESHOLD_DBM) / 25.0,
+            0.0,
+            1.0,
+        )
 
-        return np.array([
-            rsrp_norm,
-            delta / 5.0,
-            self.ue_speed / 45.0,
-            self.ue_relative_x / 1200.0,
-            self.inter_relay_dist / 1200.0
-        ], dtype=np.float32)
+        return np.array(
+            [
+                rsrp_norm,
+                delta / 5.0,
+                self.ue_speed / max(self.max_speed, 1e-6),
+                self.ue_relative_x / max(self.max_inter_relay_dist, 1e-6),
+                self.inter_relay_dist / max(self.max_inter_relay_dist, 1e-6),
+            ],
+            dtype=np.float32,
+        )
