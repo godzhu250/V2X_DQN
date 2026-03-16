@@ -27,8 +27,10 @@ class VehicleEnv:
 
         self.ttt_counter = 0
         self.time_step = 0
-        self.last_ho_time = -9999
+        self.last_success_ho_time = -10**9
         self.steps_since_last_ho = 0
+        self.current_relay_id = 0
+        self.prev_relay_id_before_last_success_ho = None
 
         self.episode_stats = {}
 
@@ -53,8 +55,10 @@ class VehicleEnv:
 
         self.ttt_counter = 0
         self.time_step = 0
-        self.last_ho_time = -9999
+        self.last_success_ho_time = -10**9
         self.steps_since_last_ho = 0
+        self.current_relay_id = 0
+        self.prev_relay_id_before_last_success_ho = None
 
         self.episode_stats = {
             "ho_attempted": 0,
@@ -105,8 +109,15 @@ class VehicleEnv:
         selected_threshold = config.ACTION_THRESHOLDS[action_index]
         self.ue_relative_x += self.ue_speed * config.SIM_STEP_SECONDS
 
-        rsrp_serving = self._calculate_physics_rsrp(self.ue_relative_x)
+        # This environment keeps the original dual-relay geometric flip backbone:
+        # ue_relative_x is interpreted as distance to current serving relay.
+        # Target relay is the opposite relay (1 - current_relay_id).
+        serving_relay_id = self.current_relay_id
+        target_relay_id = 1 - serving_relay_id
+
+        dist_serving = self.ue_relative_x
         dist_target = abs(self.inter_relay_dist - self.ue_relative_x)
+        rsrp_serving = self._calculate_physics_rsrp(dist_serving)
         rsrp_target = self._calculate_physics_rsrp(dist_target)
 
         trigger_reselection = False
@@ -115,9 +126,9 @@ class VehicleEnv:
         else:
             self.ttt_counter = 0
 
+        # Attempt definition: threshold + TTT only.
         if self.ttt_counter >= config.TTT_STEPS:
-            if rsrp_target > (rsrp_serving + config.HYSTERESIS_DB):
-                trigger_reselection = True
+            trigger_reselection = True
 
         ho_attempted = 1 if trigger_reselection else 0
         ho_success = 0
@@ -125,17 +136,32 @@ class VehicleEnv:
         pingpong = 0
 
         if trigger_reselection:
-            if rsrp_target < config.TARGET_RSRP_FAIL_THRESHOLD_DBM:
-                ho_failed = 1
-            else:
+            target_quality_ok = rsrp_target >= config.TARGET_RSRP_FAIL_THRESHOLD_DBM
+            target_has_margin = rsrp_target >= (rsrp_serving + config.SUCCESS_MARGIN_DB)
+
+            if target_quality_ok and target_has_margin:
                 ho_success = 1
 
-                if (self.time_step - self.last_ho_time) < config.PINGPONG_WINDOW_STEPS:
+                old_relay_id = self.current_relay_id
+                new_relay_id = 1 - old_relay_id
+
+                # Ping-pong: successful HO that returns to previous relay in short window.
+                if (
+                    self.prev_relay_id_before_last_success_ho is not None
+                    and new_relay_id == self.prev_relay_id_before_last_success_ho
+                    and (self.time_step - self.last_success_ho_time) < config.PINGPONG_WINDOW_STEPS
+                ):
                     pingpong = 1
 
-                self.last_ho_time = self.time_step
+                self.prev_relay_id_before_last_success_ho = old_relay_id
+                self.current_relay_id = new_relay_id
+                self.last_success_ho_time = self.time_step
+
+                # Keep original geometry flip and synchronize with relay-id update.
                 self.ue_relative_x = max(5.0, abs(self.inter_relay_dist - self.ue_relative_x))
                 rsrp_serving = self._calculate_physics_rsrp(self.ue_relative_x)
+            else:
+                ho_failed = 1
 
             self.ttt_counter = 0
 
@@ -194,6 +220,8 @@ class VehicleEnv:
             "threshold_dbm": selected_threshold,
             "rsrp": float(rsrp_serving),
             "target_rsrp": float(rsrp_target),
+            "serving_relay_id": int(serving_relay_id),
+            "target_relay_id": int(target_relay_id),
             "ho_attempted": ho_attempted,
             "ho_success": ho_success,
             "ho_failed": ho_failed,

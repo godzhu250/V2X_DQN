@@ -1,109 +1,118 @@
-﻿# V2X_DQN (Single-Scenario Refactor)
+﻿# V2X_DQN (Single-Scenario Pipeline)
 
-This project now uses a clean single-scenario DRL pipeline for SL-RSRP threshold adaptation:
-- Highway-only experiment flow
-- Urban-only experiment flow
+This project uses a single-scenario workflow for SL-RSRP threshold adaptation:
+- Highway-only
+- Urban-only
 
-The old mixed scene switching flow (Highway/Urban alternating every 200 episodes) is removed from the main workflow.
+## Core Structure
 
-## Project Goal
+- `config.py`
+- `vehicle_env.py`
+- `base_agent.py`
+- `dqn_agent.py`
+- `lstm_dqn_agent.py`
+- `01_baseline_highway.py`
+- `01_baseline_urban.py`
+- `02_main.py` (shared training core)
+- `02_train_highway.py` (Highway entry)
+- `02_train_urban.py` (Urban entry)
+- `03_plot_paper_figures.py`
 
-Train and compare:
-- DQN (MLP)
-- DRQN (LSTM)
+## Episode Length
 
-against fixed-threshold baselines under one scenario at a time.
-
-## Main Files
-
-- `config.py`: global settings (scenario profiles, episode length, reward weights, training defaults)
-- `vehicle_env.py`: single-scenario environment with fixed-length episode and attempt-based KPI accounting
-- `base_agent.py`: agent interface
-- `dqn_agent.py`: DQN (MLP)
-- `lstm_dqn_agent.py`: DRQN (LSTM)
-- `01_baseline_highway.py`: Highway fixed-threshold baseline search
-- `01_baseline_urban.py`: Urban fixed-threshold baseline search
-- `02_train_highway.py`: Highway training for DQN + DRQN
-- `02_train_urban.py`: Urban training for DQN + DRQN
-- `03_plot_paper_figures.py`: unified plotting script for paper/PPT-aligned figures
-
-## Episode Time Definition
-
-Each episode is fixed:
 - `EPISODE_STEPS = 500`
 - `SIM_STEP_SECONDS = 0.1`
-- Episode duration = `500 * 0.1 = 50 seconds`
+- Each episode = `500 * 0.1 = 50 seconds`
 
-Episode termination is only based on step count reaching 500.
+Episode termination is fixed-length only.
 
-## KPI Definitions (Attempt-Based)
+## KPI Definitions
 
 Per episode:
 - `HFR = ho_failed / max(ho_attempted, 1)`
 - `PPR = pingpong / max(ho_attempted, 1)`
 - `EHR = 1 - HFR - PPR`
 
-Notes:
-- `ho_failed` counts only handover/reselection failures after attempt.
-- `weak_signal_event` is tracked separately and does **not** count as HFR.
+Final comparison uses aggregate KPI:
+- `aggregate_HFR = sum(ho_failed) / sum(ho_attempted)`
+- `aggregate_PPR = sum(pingpong) / sum(ho_attempted)`
+- `aggregate_EHR = 1 - aggregate_HFR - aggregate_PPR`
 
-## Output Layout
+## Reselection Logic
 
-- `Result/highway/baseline/...`
-- `Result/highway/train/...`
-- `Result/highway/figures/...`
-- `Result/urban/baseline/...`
-- `Result/urban/train/...`
-- `Result/urban/figures/...`
+Attempt is triggered by:
+- serving RSRP below selected threshold
+- condition holds for TTT
 
-## Highway Workflow
+Then success/failure is judged in a second stage:
+- target relay quality above `TARGET_RSRP_FAIL_THRESHOLD_DBM`
+- and target has at least `SUCCESS_MARGIN_DB` superiority over current serving relay
+- `ho_attempted` is counted regardless of success/failure
+- `HYSTERESIS_DB` is kept in config for compatibility/other logic, but success decision uses `SUCCESS_MARGIN_DB`
 
-1. Run Highway baseline:
+So target condition is no longer a pre-filter for whether attempt exists.
 
+Ping-pong is defined as:
+- a successful HO that returns to the previous relay
+- within `PINGPONG_WINDOW_STEPS`
+
+The current environment is still a simplified dual-relay environment.
+It keeps the original dual-relay geometric flip backbone and adds explicit relay IDs
+for stricter ping-pong detection consistency.
+
+## Baseline Workflow
+
+Highway:
 ```bash
 python 01_baseline_highway.py
 ```
 
-2. Run Highway training (default: 3 seeds `71,123,456`, 3000 episodes):
-
-```bash
-python 02_train_highway.py
-```
-
-3. Generate Highway paper figures:
-
-```bash
-python 03_plot_paper_figures.py --scenario highway
-```
-
-## Urban Workflow
-
-1. Run Urban baseline:
-
+Urban:
 ```bash
 python 01_baseline_urban.py
 ```
 
-2. Run Urban training:
+## Training Workflow
 
+Shared core:
+- `02_main.py` provides `run_training(scenario, seeds, episodes, output_dir)`
+
+Highway entry (default 3 seeds + 3000 episodes):
+```bash
+python 02_train_highway.py
+```
+
+Urban entry:
 ```bash
 python 02_train_urban.py
 ```
 
-3. Generate Urban paper figures:
+## Plotting Workflow
 
+Highway:
+```bash
+python 03_plot_paper_figures.py --scenario highway
+```
+
+Urban:
 ```bash
 python 03_plot_paper_figures.py --scenario urban
 ```
 
-## Deprecated Old Flow
+## Figure Outputs (fixed set)
 
-The following old mixed-scene scripts are deprecated and removed from main usage:
-- `01_discovery_and_baseline.py`
-- `02_main.py`
-- `02_seed_supplement.py`
-- `03_kpi_trends.py`
-- `04_bar_and_leap.py`
-- `05_scene_bar.py`
-- `06.py`
-- `07.py`
+Trend figures:
+- `fig_reward_trend.png`
+- `fig_hfr_trend.png`
+- `fig_ppr_trend.png`
+- `fig_ehr_trend.png`
+
+Final bar figures:
+- `fig_hfr_bar.png`
+- `fig_ppr_bar.png`
+- `fig_ehr_bar.png`
+
+Plot colors:
+- DQN (MLP): red
+- LSTM-DQN: blue
+- Fixed baseline: gray dashed line (trend)
