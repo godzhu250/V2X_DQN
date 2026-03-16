@@ -32,7 +32,16 @@ class VehicleEnv:
         self.current_relay_id = 0
         self.prev_relay_id_before_last_success_ho = None
 
+        self._reset_pending_state()
         self.episode_stats = {}
+
+    def _reset_pending_state(self):
+        self.pending_ho = False
+        self.pending_target_relay_id = None
+        self.pending_window_remaining = 0
+        self.pending_success_counter = 0
+        self.pending_failure_counter = 0
+        self.pending_old_relay_id = None
 
     def _validate_scenario(self, scenario):
         if scenario not in config.SCENARIO_PROFILES:
@@ -59,6 +68,7 @@ class VehicleEnv:
         self.steps_since_last_ho = 0
         self.current_relay_id = 0
         self.prev_relay_id_before_last_success_ho = None
+        self._reset_pending_state()
 
         self.episode_stats = {
             "ho_attempted": 0,
@@ -66,6 +76,9 @@ class VehicleEnv:
             "ho_failed": 0,
             "pingpong": 0,
             "weak_signal_event": 0,
+            "pending_validation_started": 0,
+            "validation_success": 0,
+            "validation_failure": 0,
         }
 
         self.ue_relative_x = np.random.uniform(0.0, 50.0)
@@ -86,15 +99,41 @@ class VehicleEnv:
         noise = np.random.normal(0.0, self.shadowing_std)
         return config.TX_POWER_DBM - path_loss + noise
 
+    def _distance_to_relay(self, relay_id):
+        # Minimal-change geometry: keep mirrored backbone and bind serving/target via relay id.
+        if relay_id == self.current_relay_id:
+            return self.ue_relative_x
+        return abs(self.inter_relay_dist - self.ue_relative_x)
+
+    def _compute_serving_target_rsrp(self, serving_relay_id, target_relay_id):
+        dist_serving = self._distance_to_relay(serving_relay_id)
+        dist_target = self._distance_to_relay(target_relay_id)
+        rsrp_serving = self._calculate_physics_rsrp(dist_serving)
+        rsrp_target = self._calculate_physics_rsrp(dist_target)
+        return rsrp_serving, rsrp_target
+
+    def _target_condition(self, rsrp_serving, rsrp_target):
+        target_quality_ok = rsrp_target >= config.TARGET_RSRP_FAIL_THRESHOLD_DBM
+        target_has_margin = rsrp_target >= (rsrp_serving + config.SUCCESS_MARGIN_DB)
+        return bool(target_quality_ok and target_has_margin)
+
     def _episode_kpi(self):
-        attempts = max(self.episode_stats["ho_attempted"], 1)
-        hfr = self.episode_stats["ho_failed"] / attempts
-        ppr = self.episode_stats["pingpong"] / attempts
-        ehr = 1.0 - hfr - ppr
+        attempts = int(self.episode_stats["ho_attempted"])
+        if attempts == 0:
+            hfr = np.nan
+            ppr = np.nan
+            ehr = np.nan
+            no_attempt_episode = 1
+        else:
+            hfr = self.episode_stats["ho_failed"] / attempts
+            ppr = self.episode_stats["pingpong"] / attempts
+            ehr = 1.0 - hfr - ppr
+            no_attempt_episode = 0
         return {
             "hfr": float(hfr),
             "ppr": float(ppr),
             "ehr": float(ehr),
+            "no_attempt_episode": int(no_attempt_episode),
         }
 
     def get_episode_stats(self):
@@ -109,61 +148,94 @@ class VehicleEnv:
         selected_threshold = config.ACTION_THRESHOLDS[action_index]
         self.ue_relative_x += self.ue_speed * config.SIM_STEP_SECONDS
 
-        # This environment keeps the original dual-relay geometric flip backbone:
-        # ue_relative_x is interpreted as distance to current serving relay.
-        # Target relay is the opposite relay (1 - current_relay_id).
         serving_relay_id = self.current_relay_id
-        target_relay_id = 1 - serving_relay_id
-
-        dist_serving = self.ue_relative_x
-        dist_target = abs(self.inter_relay_dist - self.ue_relative_x)
-        rsrp_serving = self._calculate_physics_rsrp(dist_serving)
-        rsrp_target = self._calculate_physics_rsrp(dist_target)
-
-        trigger_reselection = False
-        if rsrp_serving < selected_threshold:
-            self.ttt_counter += 1
+        if self.pending_ho and self.pending_target_relay_id is not None:
+            target_relay_id = self.pending_target_relay_id
         else:
-            self.ttt_counter = 0
+            target_relay_id = 1 - serving_relay_id
 
-        # Attempt definition: threshold + TTT only.
-        if self.ttt_counter >= config.TTT_STEPS:
-            trigger_reselection = True
+        rsrp_serving, rsrp_target = self._compute_serving_target_rsrp(
+            serving_relay_id,
+            target_relay_id,
+        )
 
-        ho_attempted = 1 if trigger_reselection else 0
+        ho_attempted = 0
         ho_success = 0
         ho_failed = 0
         pingpong = 0
 
-        if trigger_reselection:
-            target_quality_ok = rsrp_target >= config.TARGET_RSRP_FAIL_THRESHOLD_DBM
-            target_has_margin = rsrp_target >= (rsrp_serving + config.SUCCESS_MARGIN_DB)
-
-            if target_quality_ok and target_has_margin:
-                ho_success = 1
-
-                old_relay_id = self.current_relay_id
-                new_relay_id = 1 - old_relay_id
-
-                # Ping-pong: successful HO that returns to previous relay in short window.
-                if (
-                    self.prev_relay_id_before_last_success_ho is not None
-                    and new_relay_id == self.prev_relay_id_before_last_success_ho
-                    and (self.time_step - self.last_success_ho_time) < config.PINGPONG_WINDOW_STEPS
-                ):
-                    pingpong = 1
-
-                self.prev_relay_id_before_last_success_ho = old_relay_id
-                self.current_relay_id = new_relay_id
-                self.last_success_ho_time = self.time_step
-
-                # Keep original geometry flip and synchronize with relay-id update.
-                self.ue_relative_x = max(5.0, abs(self.inter_relay_dist - self.ue_relative_x))
-                rsrp_serving = self._calculate_physics_rsrp(self.ue_relative_x)
+        if self.pending_ho:
+            if self._target_condition(rsrp_serving, rsrp_target):
+                self.pending_success_counter += 1
             else:
-                ho_failed = 1
+                self.pending_failure_counter += 1
 
-            self.ttt_counter = 0
+            self.pending_window_remaining -= 1
+
+            if self.pending_window_remaining <= 0:
+                success_ratio = self.pending_success_counter / max(1, int(config.HO_VALIDATION_STEPS))
+
+                if success_ratio >= float(config.VALIDATION_MIN_SUCCESS_RATIO):
+                    ho_success = 1
+
+                    old_relay_id = (
+                        self.pending_old_relay_id
+                        if self.pending_old_relay_id is not None
+                        else self.current_relay_id
+                    )
+                    new_relay_id = (
+                        self.pending_target_relay_id
+                        if self.pending_target_relay_id is not None
+                        else (1 - old_relay_id)
+                    )
+
+                    if (
+                        self.prev_relay_id_before_last_success_ho is not None
+                        and new_relay_id == self.prev_relay_id_before_last_success_ho
+                        and (self.time_step - self.last_success_ho_time) < config.PINGPONG_WINDOW_STEPS
+                    ):
+                        pingpong = 1
+
+                    self.prev_relay_id_before_last_success_ho = old_relay_id
+                    self.current_relay_id = new_relay_id
+                    self.last_success_ho_time = self.time_step
+
+                    mirrored_x = abs(self.inter_relay_dist - self.ue_relative_x)
+                    # Coordinate-equivalent handling:
+                    # in this local-distance representation, larger x means less stable serving.
+                    # therefore a negative config.POST_HO_POSITION_OFFSET_M should push x upward.
+                    unstable_shift = -config.POST_HO_POSITION_OFFSET_M
+                    self.ue_relative_x = max(
+                        5.0,
+                        mirrored_x + unstable_shift,
+                    )
+
+                    rsrp_serving, rsrp_target = self._compute_serving_target_rsrp(
+                        self.current_relay_id,
+                        1 - self.current_relay_id,
+                    )
+                    self.episode_stats["validation_success"] += 1
+                else:
+                    ho_failed = 1
+                    self.episode_stats["validation_failure"] += 1
+
+                self._reset_pending_state()
+        else:
+            if rsrp_serving < selected_threshold:
+                self.ttt_counter += 1
+            else:
+                self.ttt_counter = 0
+
+            if self.ttt_counter >= config.TTT_STEPS:
+                ho_attempted = 1
+                self.pending_ho = True
+                self.pending_target_relay_id = 1 - self.current_relay_id
+                self.pending_window_remaining = int(config.HO_VALIDATION_STEPS)
+                self.pending_success_counter = 0
+                self.pending_failure_counter = 0
+                self.pending_old_relay_id = self.current_relay_id
+                self.episode_stats["pending_validation_started"] += 1
+                self.ttt_counter = 0
 
         if ho_success:
             self.steps_since_last_ho = 0
@@ -227,11 +299,18 @@ class VehicleEnv:
             "ho_failed": ho_failed,
             "pingpong": pingpong,
             "weak_signal_event": weak_signal_event,
+            "pending_ho": int(self.pending_ho),
+            "pending_window_remaining": int(self.pending_window_remaining),
+            "pending_success_counter": int(self.pending_success_counter),
+            "pending_failure_counter": int(self.pending_failure_counter),
             "episode_ho_attempted": self.episode_stats["ho_attempted"],
             "episode_ho_success": self.episode_stats["ho_success"],
             "episode_ho_failed": self.episode_stats["ho_failed"],
             "episode_pingpong": self.episode_stats["pingpong"],
             "episode_weak_signal_event": self.episode_stats["weak_signal_event"],
+            "episode_pending_validation_started": self.episode_stats["pending_validation_started"],
+            "episode_validation_success": self.episode_stats["validation_success"],
+            "episode_validation_failure": self.episode_stats["validation_failure"],
         }
         info.update(self._episode_kpi())
 

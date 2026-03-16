@@ -40,12 +40,12 @@ def parse_args():
 
 
 def moving_average(x, window):
-    x = np.asarray(x, dtype=float)
-    if x.size == 0:
-        return x
-    window = int(max(1, min(window, x.size)))
-    kernel = np.ones(window, dtype=float) / window
-    return np.convolve(x, kernel, mode="same")
+    series = pd.Series(np.asarray(x, dtype=float))
+    if series.empty:
+        return series.to_numpy(dtype=float)
+    window = int(max(1, min(window, len(series))))
+    # Keep NaN semantics: windows with no valid KPI values remain NaN.
+    return series.rolling(window=window, min_periods=1).mean().to_numpy(dtype=float)
 
 
 def _find_files(train_dir, file_tags):
@@ -73,7 +73,8 @@ def load_mean_curve(train_dir, file_tags, metric):
 
     min_len = min(len(c) for c in curves)
     arr = np.array([c[:min_len] for c in curves], dtype=float)
-    return np.mean(arr, axis=0), paths
+    mean_curve = pd.DataFrame(arr).mean(axis=0, skipna=True).to_numpy(dtype=float)
+    return mean_curve, paths
 
 
 def load_baseline(baseline_dir):
@@ -213,7 +214,7 @@ def main():
     plot_trend(
         fig_dir=fig_dir,
         file_name="fig_hfr_trend.png",
-        title=f"{scenario_title} HFR Trend",
+        title=f"{scenario_title} HFR Trend (no-attempt episodes excluded)",
         ylabel="HFR",
         curves=hfr_curves,
         baseline_value=float(baseline["aggregate_hfr"]),
@@ -222,7 +223,7 @@ def main():
     plot_trend(
         fig_dir=fig_dir,
         file_name="fig_ppr_trend.png",
-        title=f"{scenario_title} PPR Trend",
+        title=f"{scenario_title} PPR Trend (no-attempt episodes excluded)",
         ylabel="PPR",
         curves=ppr_curves,
         baseline_value=float(baseline["aggregate_ppr"]),
@@ -231,7 +232,7 @@ def main():
     plot_trend(
         fig_dir=fig_dir,
         file_name="fig_ehr_trend.png",
-        title=f"{scenario_title} EHR Trend",
+        title=f"{scenario_title} EHR Trend (no-attempt episodes excluded)",
         ylabel="EHR",
         curves=ehr_curves,
         baseline_value=float(baseline["aggregate_ehr"]),

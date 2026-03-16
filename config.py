@@ -41,11 +41,15 @@ NOISE_FLOOR_DBM = THERMAL_NOISE_DENSITY + 10 * np.log10(BANDWIDTH_HZ) + NOISE_FI
 # 3GPP reselection core logic
 # ============================================================
 HYSTERESIS_DB = 3.0
-TTT_STEPS = 3
-TARGET_RSRP_FAIL_THRESHOLD_DBM = -105.0
-SUCCESS_MARGIN_DB = 0.0
-PINGPONG_WINDOW_STEPS = 10  # 1 second with 0.1s step
-WEAK_SIGNAL_THRESHOLD_DBM = -115.0
+TTT_SECONDS = 0.3
+TTT_STEPS = int(round(TTT_SECONDS / SIM_STEP_SECONDS))
+TARGET_RSRP_FAIL_THRESHOLD_DBM = -80.0
+SUCCESS_MARGIN_DB = -1.0
+PINGPONG_WINDOW_STEPS = 150  # 15 seconds with 0.1s step
+WEAK_SIGNAL_THRESHOLD_DBM = -105.0
+HO_VALIDATION_STEPS = 5
+VALIDATION_MIN_SUCCESS_RATIO = 0.6
+POST_HO_POSITION_OFFSET_M = -70.0
 
 # ============================================================
 # RL action/state/training
@@ -62,8 +66,12 @@ BATCH_SIZE = 256
 EPSILON_START = 1.0
 EPSILON_END = 0.05
 EPSILON_DECAY = 0.997
+EPS_START = 1.0
+EPS_END = 0.05
+EPS_DECAY = 1500
 
 TARGET_UPDATE_INTERVAL = 10
+TRAIN_FREQ = 4
 
 # ============================================================
 # Reward weights (explicitly configurable)
@@ -99,3 +107,4 @@ URBAN_EPISODES = 3000
 
 BASELINE_EVAL_EPISODES = 200
 BASELINE_SEED = 250
+BASELINE_MIN_TOTAL_ATTEMPTS = 20
