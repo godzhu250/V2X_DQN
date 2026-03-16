@@ -1,0 +1,6 @@
+git add .
+git commit -m "update reward function"
+git push 
+
+
+-m后边是说明本次改动
