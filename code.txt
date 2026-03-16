@@ -1,0 +1,1171 @@
+#vehicle_env.py
+import numpy as np
+import config
+import utils 
+
+class VehicleEnv:
+    def __init__(self):
+        self.action_space_n = config.ACTION_DIM
+        self.state_dim = config.STATE_DIM
+        self.last_rsrp = -80.0
+        self.scenario_type = 'Highway'
+
+        # 统计量
+        self.handover_count = 0
+        self.rlf_steps = 0
+        self.pingpong_count = 0
+        self.ttt_counter = 0
+        self.time_step = 0
+        self.last_ho_time = -999  # 用于判定乒乓切换的时间点
+        self.steps_since_last_ho = 0
+
+        self.current_rsrp = self.last_rsrp
+        self.ue_relative_x = 0.0
+        self.inter_relay_dist = 1200.0
+        self.shadowing_std = 4.0
+        self.ue_speed = 35.0
+
+    def reset(self, force_scenario=None):
+        self.handover_count = 0
+        self.rlf_steps = 0
+        self.pingpong_count = 0
+        self.ttt_counter = 0
+        self.time_step = 0
+        self.last_ho_time = -999
+        self.steps_since_last_ho = 0
+
+        # 随机场景或按指定场景重置
+        self.scenario_type = force_scenario if force_scenario else np.random.choice(['Highway', 'Urban'])
+
+        if self.scenario_type == 'Highway':
+            self.inter_relay_dist, self.shadowing_std, self.ue_speed = 1200.0, 4.0, 35.0
+        else:
+            self.inter_relay_dist, self.shadowing_std, self.ue_speed = 350.0, 8.0, 5.0
+
+        self.ue_relative_x = np.random.uniform(0, 50)
+        self.current_rsrp = self._calculate_physics_rsrp(self.ue_relative_x)
+        self.last_rsrp = self.current_rsrp
+        return self._get_state()
+
+    def _calculate_physics_rsrp(self, distance):
+        """严格遵循 3GPP TR 38.901 的路径损耗建模。"""
+        d = max(1.0, distance)
+        fc = config.FC
+        if self.scenario_type == 'Urban':
+            path_loss = 35.3 + 31.9 * np.log10(d) + 20 * np.log10(fc)
+        else:
+            path_loss = 32.4 + 21.0 * np.log10(d) + 20 * np.log10(fc)
+        noise = np.random.normal(0, self.shadowing_std)
+        return config.TX_POWER_DBM - path_loss + noise
+
+    def step(self, action_index):
+        selected_threshold = config.ACTION_THRESHOLDS[action_index]
+        self.ue_relative_x += self.ue_speed * config.SIM_STEP_SECONDS
+
+        rsrp_serving = self._calculate_physics_rsrp(self.ue_relative_x)
+        dist_target = abs(self.inter_relay_dist - self.ue_relative_x)
+        rsrp_target = self._calculate_physics_rsrp(dist_target)
+
+        # 3GPP TTT 触发逻辑
+        trigger_reselection = False
+        if rsrp_serving < selected_threshold:
+            self.ttt_counter += 1
+        else:
+            self.ttt_counter = 0
+
+        if self.ttt_counter >= config.TTT_STEPS:
+            if rsrp_target > (rsrp_serving + config.HYSTERESIS_DB):
+                trigger_reselection = True
+
+        ho_attempted = 1 if trigger_reselection else 0
+        handover_occurred, handover_failed, is_pingpong = False, False, 0
+
+        if trigger_reselection:
+            if rsrp_target < -105:
+                handover_failed = True
+            else:
+                # 乒乓判定：1秒内再次切换
+                if self.time_step - self.last_ho_time < 10:
+                    is_pingpong = 1
+                    self.pingpong_count += 1
+
+                self.last_ho_time = self.time_step
+                self.ue_relative_x = max(5.0, abs(self.inter_relay_dist - self.ue_relative_x))
+                rsrp_serving = self._calculate_physics_rsrp(self.ue_relative_x)
+
+                # 切换成功计数
+                self.handover_count += 1
+                handover_occurred = True
+
+            self.ttt_counter = 0
+
+        if handover_occurred:
+            self.steps_since_last_ho = 0
+        else:
+            self.steps_since_last_ho += 1
+
+        # KPI 统计逻辑
+        # HFR 只统计真实切换失败
+        is_rlf = 1 if handover_failed else 0
+        # 弱信号单独统计（不计入 HFR）
+        is_weak_signal = 1 if rsrp_serving < -115 else 0
+        # 仅用于环境内部链路失败惩罚
+        is_link_fail = 1 if (is_weak_signal or handover_failed) else 0
+        if is_link_fail:
+            self.rlf_steps += 1
+
+        # Reward 数值稳定化（不改变训练主流程与协议逻辑）
+        reward = 0.0
+        done = False
+
+        # 1) 信号质量奖励：RSRP 映射到 [0,1] 再缩放
+        if rsrp_serving > -115:
+            q_norm = (rsrp_serving + 115.0) / 25.0
+            q_norm = float(np.clip(q_norm, 0.0, 1.0))
+            reward += 5.0 * q_norm
+
+        # 2) 断连惩罚：触发后终止 episode
+        if is_link_fail:
+            reward -= 200.0
+            done = True
+
+        # 3) 切换惩罚：含递增项并封顶
+        if handover_occurred:
+            nth = max(0, self.handover_count - 1)
+            ho_pen = 5.0 + 1.0 * min(nth, 10)
+            reward -= ho_pen
+
+        # 4) 乒乓额外惩罚
+        if is_pingpong:
+            reward -= 8.0
+
+        # 5) 存活奖励
+        if not done:
+            reward += 0.5
+
+        # 6) 长期不切换惩罚：仅在弱覆盖区（RSRP<-100 dBm）触发
+        if (not done) and (rsrp_serving < -100) and (self.steps_since_last_ho > 80):
+            stagnation_pen = 0.1 * (self.steps_since_last_ho - 80) / 100.0
+            reward -= min(stagnation_pen, 1.0)
+
+        # episode 终止条件
+        self.current_rsrp = rsrp_serving
+        self.time_step += 1
+        if self.ue_relative_x > (self.inter_relay_dist + 200) or self.time_step > 500:
+            done = True
+
+        return self._get_state(), reward, done, {
+            'rsrp': rsrp_serving,
+            'is_rlf': is_rlf,
+            'is_weak_signal': is_weak_signal,
+            'is_pingpong': is_pingpong,
+            'ho_attempted': ho_attempted,
+            'ho_happened': 1 if handover_occurred else 0,
+            'ttt': self.ttt_counter
+        }
+
+    def _get_state(self):
+        delta = self.current_rsrp - self.last_rsrp
+        self.last_rsrp = self.current_rsrp
+
+        rsrp_norm = (self.current_rsrp + 115.0) / 25.0
+        rsrp_norm = float(np.clip(rsrp_norm, 0.0, 1.0))
+
+        return np.array([
+            rsrp_norm,
+            delta / 5.0,
+            self.ue_speed / 45.0,
+            self.ue_relative_x / 1200.0,
+            self.inter_relay_dist / 1200.0
+        ], dtype=np.float32)
+
+
+#01
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from vehicle_env import VehicleEnv
+import config
+import os
+
+def run_ep(env, idx, scen):
+    env.reset(force_scenario=scen)
+    score, done = 0, False
+    while not done:
+        _, r, done, _ = env.step(idx)
+        score += r
+    return score
+
+def run_ep_with_kpi(env, idx, scen):
+    env.reset(force_scenario=scen)
+    score, done = 0.0, False
+    ep_ho_fail, ep_pp, ep_ho = 0, 0, 0
+    while not done:
+        _, r, done, info = env.step(idx)
+        score += float(r)
+        ep_ho_fail += int(info.get('is_rlf', 0))
+        ep_pp += int(info.get('is_pingpong', 0))
+        ep_ho += int(info.get('ho_attempted', 0))  # ��02һ��
+    hfr = ep_ho_fail / max(ep_ho, 1)
+    ppr = ep_pp / (ep_ho + 1e-6)
+    ehr = float(np.clip(1.0 - hfr - ppr, 0.0, 1.0))
+    return score, hfr, ppr, ehr
+
+def main():
+    print("?? Stage 0 & 1: Protocol Sanity & Pareto Baseline (Optimized)")
+    env = VehicleEnv()
+    os.makedirs("Result", exist_ok=True)
+    thresholds = config.ACTION_THRESHOLDS
+    labels = [f"{t}dBm" for t in thresholds]
+
+    # --- 1. 01a_Protocol_Sanity (Э���߼���֤���µ����ޣ����Ӵ�����) ---
+    print("  Running Stage 01a...")
+    env.reset(force_scenario='Urban')
+    test_thresh_val = -100 # ?? �µ����ޣ�ȷ���ź��ܲ�����������
+    test_idx = 3 # ��Ӧ -105dBm
+    
+    rsrp_h, ttt_h = [], []
+    trig_step = None
+    for t in range(150):
+        _, _, _, info = env.step(test_idx)
+        rsrp_h.append(info['rsrp'])
+        ttt_h.append(info['ttt'])
+        if info['ttt'] >= config.TTT_STEPS and trig_step is None:
+            trig_step = t
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(rsrp_h, label='Measured SL-RSRP', color='tab:blue', linewidth=1.5)
+    plt.axhline(y=test_thresh_val, color='red', linestyle='--', label=f'IE: sl-RSRP-Thresh ({test_thresh_val}dBm)')
+    
+    if trig_step is not None:
+        # ?? ������� TTT ��Ӱ������ͼ����������
+        plt.scatter(trig_step, rsrp_h[trig_step], color='red', s=100, zorder=5, label='3GPP Trigger Point')
+        plt.axvspan(trig_step - config.TTT_STEPS, trig_step, color='red', alpha=0.1, label='TTT Window')
+        
+    plt.title("TS 38.331 Protocol Logic Verification (Standard Compliance)", fontsize=12)
+    plt.xlabel("Time Step (100ms)"); plt.ylabel("RSRP (dBm)")
+    plt.legend(loc='upper right', fontsize=9); plt.grid(True, alpha=0.2)
+    plt.savefig("Result/01a_Protocol_Sanity.png", dpi=300)
+
+    # --- 2. 01b_Crossover_Proof (����֤�������ӷ�ֵ���ֱ�ע) ---
+    print("  Running Stage 01b...")
+    h_scores, u_scores = [], []
+    for i in range(len(thresholds)):
+        h_scores.append(np.mean([run_ep(env, i, 'Highway') for _ in range(100)]))
+        u_scores.append(np.mean([run_ep(env, i, 'Urban') for _ in range(100)]))
+
+    # KPI per static threshold (episode-level aggregation, consistent with Stage 02)
+    baseline_hfr, baseline_ppr, baseline_ehr = [], [], []
+    for i in range(len(thresholds)):
+        h_kpi = [run_ep_with_kpi(env, i, 'Highway') for _ in range(100)]
+        u_kpi = [run_ep_with_kpi(env, i, 'Urban') for _ in range(100)]
+        h_hfr = [x[1] for x in h_kpi]
+        h_ppr = [x[2] for x in h_kpi]
+        h_ehr = [x[3] for x in h_kpi]
+        u_hfr = [x[1] for x in u_kpi]
+        u_ppr = [x[2] for x in u_kpi]
+        u_ehr = [x[3] for x in u_kpi]
+        baseline_hfr.append(float(np.mean(h_hfr + u_hfr)))
+        baseline_ppr.append(float(np.mean(h_ppr + u_ppr)))
+        baseline_ehr.append(float(np.mean(h_ehr + u_ehr)))
+
+    plt.figure(figsize=(11, 6))
+    plt.plot(thresholds, h_scores, 'o-', label='Highway (LOS/High-Speed)', linewidth=2, markersize=8)
+    plt.plot(thresholds, u_scores, 's-', label='Urban (NLOS/Blockage)', linewidth=2, markersize=8)
+    
+    # ?? �������ֱ�ע
+    h_best_idx = np.argmax(h_scores)
+    u_best_idx = np.argmax(u_scores)
+    plt.text(thresholds[h_best_idx], h_scores[h_best_idx]+200, f"Best: {thresholds[h_best_idx]}dBm", 
+             ha='center', color='blue', weight='bold')
+    plt.text(thresholds[u_best_idx], u_scores[u_best_idx]+200, f"Best: {thresholds[u_best_idx]}dBm", 
+             ha='center', color='orange', weight='bold')
+
+    plt.title("Performance Crossover Proof", fontsize=13)
+    plt.xlabel("Static Threshold IE (dBm)"); plt.ylabel("Cumulative Reward")
+    plt.legend(); plt.grid(True, alpha=0.3); plt.savefig("Result/01b_Crossover_Proof.png", dpi=300)
+
+    # --- 3. 01c_Pareto_Baseline (�����л�׼����ղ���) ---
+    print("  Running Stage 01c...")
+    plt.figure(figsize=(10, 8))
+    plt.plot(h_scores, u_scores, 'b--o', alpha=0.4, label='Static 3GPP Limit Envelope')
+    for i, txt in enumerate(labels):
+        plt.annotate(txt, (h_scores[i], u_scores[i]), xytext=(5, -15), textcoords='offset points', color='blue', fontsize=9)
+    
+    h_max, u_max = max(h_scores), max(u_scores)
+   
+    
+    plt.xlabel("Highway Performance (Throughput)"); plt.ylabel("Urban Performance (Reliability)")
+    plt.title("The Physical Trade-off Barrier", fontsize=13, fontweight='bold')
+    
+    # ?? ���������
+    plt.xlim(min(h_scores)*0.98, h_max * 1.12)
+    plt.ylim(min(u_scores)*0.95, u_max * 1.15)
+    
+    plt.legend(loc='lower left'); plt.grid(True, linestyle=':', alpha=0.5)
+    plt.savefig("Result/01c_Pareto_Baseline.png", dpi=300)
+
+    # �����ؼ����ݹ� 05 �ű�ʹ��
+    np.savez("Result/fixed_baseline_data.npz", h_fixed=h_scores, u_fixed=u_scores, thresholds=thresholds, h_max=h_max, u_max=u_max)
+
+    # === Stage 01c: Standardized Baseline Export (for Stage-2/4) ===
+    stage1_baseline_dir = "Result/Stage1_Baseline"
+    os.makedirs(stage1_baseline_dir, exist_ok=True)
+
+    baseline_metrics_df = pd.DataFrame({
+        "threshold_dBm": thresholds,
+        "highway_score": h_scores,
+        "urban_score": u_scores,
+        "HFR": baseline_hfr,
+        "PPR": baseline_ppr,
+        "EHR": baseline_ehr,
+    })
+    baseline_metrics_df.to_csv(f"{stage1_baseline_dir}/baseline_metrics.csv", index=False)
+
+    # Pareto sweet-spot threshold (balanced trade-off on normalized Highway/Urban scores)
+    h_norm = np.array(h_scores, dtype=float) / max(h_max, 1e-6)
+    u_norm = np.array(u_scores, dtype=float) / max(u_max, 1e-6)
+    sweet_spot_idx = int(np.argmax(np.minimum(h_norm, u_norm)))
+
+    baseline_summary_df = pd.DataFrame([{
+        "best_highway_score": h_max,
+        "best_urban_score": u_max,
+        "best_highway_threshold": thresholds[h_best_idx],
+        "best_urban_threshold": thresholds[u_best_idx],
+        "baseline_threshold_dBm": thresholds[sweet_spot_idx],
+        "baseline_hfr": float(baseline_hfr[sweet_spot_idx]),
+        "baseline_ppr": float(baseline_ppr[sweet_spot_idx]),
+        "baseline_ehr": float(baseline_ehr[sweet_spot_idx]),
+    }])
+    baseline_summary_df.to_csv(f"{stage1_baseline_dir}/baseline_summary.csv", index=False)
+    print("? All Baseline stages finished successfully.")
+
+if __name__ == "__main__": main()
+
+
+#02_main.py
+import os, time, torch, numpy as np, pandas as pd
+from tqdm import tqdm
+from datetime import datetime
+import config
+from vehicle_env import VehicleEnv
+from dqn_agent import DQNAgent
+from lstm_dqn_agent import LSTMDQNAgent
+
+def train():
+    print(f"🚀 Stage 2: {config.MAX_EPISODES} Episode AI Training (Full Data Production, Matrix Format)")
+    env = VehicleEnv()
+    scenario_block_episodes = 200
+    scenario_cycle_episodes = scenario_block_episodes * 2
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    save_dir = f"Result/Tournament_10k_{timestamp}"
+    os.makedirs(save_dir, exist_ok=True)
+
+    roster = {
+        "DQN (MLP)": DQNAgent,
+        "DQN (LSTM)": LSTMDQNAgent,
+    }
+    raw_evidence = {}
+    final_report = []
+
+    for name, AgentClass in roster.items():
+        print(f"\n--- ⚔️  Training: {name} ---")
+        seeds = [71, 123]
+        
+
+        # 规整矩阵容器：每个元素最终都是 (num_seeds, MAX_EPISODES)
+        all_r, all_hfr, all_ppr, all_ehr, all_scen = [], [], [], [], []
+        all_rlf_steps, all_steps, all_pingpong, all_handover = [], [], [], []
+        all_h_r, all_h_hfr, all_h_ppr, all_h_ehr = [], [], [], []
+        all_u_r, all_u_hfr, all_u_ppr, all_u_ehr = [], [], [], []
+        inference_latencies = []
+
+        for seed in seeds:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+            agent = AgentClass()
+
+            # 每个 seed 的 episode 历史（长度=MAX_EPISODES）
+            r_hist, hfr_hist, ppr_hist, ehr_hist = [], [], [], []
+            rlf_steps_hist, steps_hist, pingpong_hist, handover_hist = [], [], [], []
+            scen_hist = []
+            h_r_hist, h_hfr_hist, h_ppr_hist, h_ehr_hist = [], [], [], []
+            u_r_hist, u_hfr_hist, u_ppr_hist, u_ehr_hist = [], [], [], []
+
+            pbar = tqdm(range(config.MAX_EPISODES), desc=f"{name} Seed {seed}")
+            for ep in pbar:
+                # 学习率退火（保留你原逻辑）
+                if ep == int(config.MAX_EPISODES * 0.7):
+                    if hasattr(agent, 'optimizer'):
+                        for pg in agent.optimizer.param_groups:
+                            pg['lr'] *= 0.1
+
+                # LSTM 记忆清理（保留你原逻辑）
+                if hasattr(agent, 'state_sequence'):
+                    agent.state_sequence.clear()
+
+                # first 200 episodes Highway, next 200 episodes Urban, then repeat
+                curr_scen = "Highway" if (ep % scenario_cycle_episodes) < scenario_block_episodes else "Urban"
+                state = env.reset(force_scenario=curr_scen)
+                scen_hist.append(curr_scen)
+
+                ep_r, ep_ho_fail, ep_pp, ep_ho, steps = 0.0, 0, 0, 0, 0
+                done = False
+
+                while not done:
+                    st_time = time.perf_counter()
+                    action = agent.select_action(state, is_training=True)
+                    inference_latencies.append((time.perf_counter() - st_time) * 1000)
+
+                    n_s, r, done, info = env.step(action)
+
+                    # 训练逻辑保持不变：step reward 直接进 buffer
+                    agent.store_transition(state, action, r, n_s, done)
+                    agent.train_step()
+
+                    state = n_s
+                    ep_r += float(r)
+
+                    # KPI 统计（与你原 02 一致）
+                    ep_ho_fail += int(info.get('is_rlf', 0))
+                    ep_pp += int(info.get('is_pingpong', 0))
+                    ep_ho += int(info.get('ho_attempted', 0))
+                    steps += 1
+
+                # 计算 KPI（与你原 02 一致）
+                hfr = ep_ho_fail / max(ep_ho, 1)
+                ppr = ep_pp / (ep_ho + 1e-6)
+                ehr = 1.0 - hfr - ppr
+
+                r_hist.append(ep_r)
+                hfr_hist.append(hfr)
+                ppr_hist.append(ppr)
+                ehr_hist.append(ehr)
+                rlf_steps_hist.append(ep_ho_fail)
+                steps_hist.append(steps)
+                pingpong_hist.append(ep_pp)
+                handover_hist.append(ep_ho)
+                if curr_scen == "Highway":
+                    h_r_hist.append(ep_r)
+                    h_hfr_hist.append(hfr)
+                    h_ppr_hist.append(ppr)
+                    h_ehr_hist.append(ehr)
+                else:
+                    u_r_hist.append(ep_r)
+                    u_hfr_hist.append(hfr)
+                    u_ppr_hist.append(ppr)
+                    u_ehr_hist.append(ehr)
+
+                if ep % 10 == 0:
+                    agent.update_target_network()
+
+            # 存储该 seed 的完整序列（长度都严格等于 MAX_EPISODES）
+            all_r.append(r_hist)
+            all_hfr.append(hfr_hist)
+            all_ppr.append(ppr_hist)
+            all_ehr.append(ehr_hist)
+            all_scen.append(scen_hist)
+            all_rlf_steps.append(rlf_steps_hist)
+            all_steps.append(steps_hist)
+            all_pingpong.append(pingpong_hist)
+            all_handover.append(handover_hist)
+            all_h_r.append(h_r_hist)
+            all_h_hfr.append(h_hfr_hist)
+            all_h_ppr.append(h_ppr_hist)
+            all_h_ehr.append(h_ehr_hist)
+            all_u_r.append(u_r_hist)
+            all_u_hfr.append(u_hfr_hist)
+            all_u_ppr.append(u_ppr_hist)
+            all_u_ehr.append(u_ehr_hist)
+
+            # 断点保护：每个 seed 一个 npz
+            np.savez(
+                f"{save_dir}/raw_{name.replace(' ', '_')}_seed{seed}.npz",
+                r=np.array(r_hist, dtype=float),
+                hfr=np.array(hfr_hist, dtype=float),
+                ppr=np.array(ppr_hist, dtype=float),
+                ehr=np.array(ehr_hist, dtype=float),
+                rlf_steps=np.array(rlf_steps_hist, dtype=float),
+                steps=np.array(steps_hist, dtype=float),
+                pingpong=np.array(pingpong_hist, dtype=float),
+                handover=np.array(handover_hist, dtype=float),
+                scen=np.array(scen_hist),
+                h_r=np.array(h_r_hist, dtype=float),
+                h_hfr=np.array(h_hfr_hist, dtype=float),
+                h_ppr=np.array(h_ppr_hist, dtype=float),
+                h_ehr=np.array(h_ehr_hist, dtype=float),
+                u_r=np.array(u_r_hist, dtype=float),
+                u_hfr=np.array(u_hfr_hist, dtype=float),
+                u_ppr=np.array(u_ppr_hist, dtype=float),
+                u_ehr=np.array(u_ehr_hist, dtype=float)
+            )
+
+        # 写入 raw_evidence（与新 03 完全匹配的 key 命名）
+        raw_evidence[f"{name}_r"] = np.array(all_r, dtype=float)       # (S, E)
+        raw_evidence[f"{name}_hfr"] = np.array(all_hfr, dtype=float)   # (S, E)
+        raw_evidence[f"{name}_ppr"] = np.array(all_ppr, dtype=float)   # (S, E)
+        raw_evidence[f"{name}_ehr"] = np.array(all_ehr, dtype=float)   # (S, E)
+        raw_evidence[f"{name}_scen"] = np.array(all_scen)              # (S, E) strings
+        raw_evidence[f"{name}_rlf_steps"] = np.array(all_rlf_steps, dtype=float)  # (S, E)
+        raw_evidence[f"{name}_steps"] = np.array(all_steps, dtype=float)           # (S, E)
+        raw_evidence[f"{name}_pingpong"] = np.array(all_pingpong, dtype=float)     # (S, E)
+        raw_evidence[f"{name}_handover"] = np.array(all_handover, dtype=float)     # (S, E)
+        raw_evidence[f"{name}_h_r"] = np.array(all_h_r, dtype=object)      # ragged by seed
+        raw_evidence[f"{name}_h_hfr"] = np.array(all_h_hfr, dtype=object)  # ragged by seed
+        raw_evidence[f"{name}_h_ppr"] = np.array(all_h_ppr, dtype=object)  # ragged by seed
+        raw_evidence[f"{name}_h_ehr"] = np.array(all_h_ehr, dtype=object)  # ragged by seed
+        raw_evidence[f"{name}_u_r"] = np.array(all_u_r, dtype=object)      # ragged by seed
+        raw_evidence[f"{name}_u_hfr"] = np.array(all_u_hfr, dtype=object)  # ragged by seed
+        raw_evidence[f"{name}_u_ppr"] = np.array(all_u_ppr, dtype=object)  # ragged by seed
+        raw_evidence[f"{name}_u_ehr"] = np.array(all_u_ehr, dtype=object)  # ragged by seed
+        model_data = {
+            "h_ehr": np.array(all_h_ehr, dtype=object),
+            "u_ehr": np.array(all_u_ehr, dtype=object),
+        }
+        raw_evidence[f"{name}_h_ehr"] = model_data["h_ehr"]
+        raw_evidence[f"{name}_u_ehr"] = model_data["u_ehr"]
+
+        # Leaderboard??????????????????
+        def tail_mean(mat_2d, tail=100):
+            mat_2d = np.asarray(mat_2d, dtype=float)
+            return float(np.mean(mat_2d[:, -tail:]))
+
+        # Highway / Urban Score?? scen mask ?????????
+        def scen_tail_mean(values_2d, scen_2d, target_scene, tail=50):
+            values_2d = np.asarray(values_2d, dtype=float)
+            scen_2d = np.asarray(scen_2d)
+            S, E = values_2d.shape
+            start = max(0, E - tail)
+            vals = []
+            for s in range(S):
+                mask = (scen_2d[s, start:E] == target_scene)
+                if np.any(mask):
+                    vals.append(np.mean(values_2d[s, start:E][mask]))
+                else:
+                    # fallback: if the tail window has no such scenario, use full-episode mean for that scenario
+                    full_mask = (scen_2d[s, :] == target_scene)
+                    if np.any(full_mask):
+                        vals.append(np.mean(values_2d[s, :][full_mask]))
+            return float(np.mean(vals)) if len(vals) > 0 else np.nan
+
+        def ragged_tail_mean(obj_arr, tail=50):
+            arr = np.asarray(obj_arr, dtype=object)
+            vals = []
+            for seq in arr:
+                seq = np.asarray(seq, dtype=float)
+                if seq.size > 0:
+                    vals.append(float(np.mean(seq[-tail:])))
+            return float(np.mean(vals)) if vals else np.nan
+
+        # For Fig05, align AI score definition with Stage1 baseline envelope:
+        # use scene-specific reward series (h_r/u_r) when available,
+        # fallback to old scenario-mask method for compatibility.
+        if f"{name}_h_r" in raw_evidence and f"{name}_u_r" in raw_evidence:
+            highway_score = ragged_tail_mean(raw_evidence[f"{name}_h_r"], tail=50)
+            urban_score = ragged_tail_mean(raw_evidence[f"{name}_u_r"], tail=50)
+        else:
+            highway_score = scen_tail_mean(raw_evidence[f"{name}_r"], raw_evidence[f"{name}_scen"], "Highway", tail=50)
+            urban_score = scen_tail_mean(raw_evidence[f"{name}_r"], raw_evidence[f"{name}_scen"], "Urban", tail=50)
+
+        final_report.append({
+            "Model": name,
+            "Mean Score": tail_mean(raw_evidence[f"{name}_r"], scenario_cycle_episodes),
+            "EHR": tail_mean(raw_evidence[f"{name}_ehr"], scenario_cycle_episodes),
+            "HFR": tail_mean(raw_evidence[f"{name}_hfr"], scenario_cycle_episodes),
+            "PPR": tail_mean(raw_evidence[f"{name}_ppr"], scenario_cycle_episodes),
+            "Latency": float(np.mean(inference_latencies)),
+            "Highway Score": highway_score,
+            "Urban Score": urban_score,
+        })
+
+        pd.DataFrame(final_report).to_csv(f"{save_dir}/final_leaderboard.csv", index=False)
+
+    np.savez(f"{save_dir}/raw_evidence.npz", **raw_evidence)
+    print(f"🏁 Training Complete. Data saved in {save_dir}. Now run 03 and 04.")
+
+if __name__ == "__main__":
+    train()
+
+
+#03_kpi_trends.py
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import pandas as pd
+
+
+def rolling_mean(x, window=100):
+    return pd.Series(x, dtype=float).rolling(window, min_periods=1).mean().values
+
+
+def smooth_series(arr, window=100):
+    arr = np.asarray(arr, dtype=float)
+    if len(arr) == 0:
+        return arr
+    # Dynamic clipping: min(smooth, max(1, len(y)//5))
+    dyn_window = max(1, len(arr) // 5)
+    window = int(max(1, min(window, dyn_window)))
+    return rolling_mean(arr, window=window)
+
+
+def plot_and_save(data_dict, title, ylabel, filename, folder, smooth=100, ylim=None, ylim_bottom=None,
+                  metric_type=None, baseline_value=None):
+    plt.figure(figsize=(10, 5))
+    y_max_candidates = []
+    for name, series in data_dict.items():
+        mean_curve, _ = pad_nan_and_nanmean_std(series)
+        if len(mean_curve) == 0:
+            continue
+        mean_s = smooth_series(mean_curve, window=smooth)
+        if len(mean_s) == 0:
+            continue
+        y_max_candidates.append(float(np.nanmax(mean_s)))
+        plt.plot(mean_s, label=name, linewidth=2)
+
+    if baseline_value is not None and np.isfinite(baseline_value):
+        plt.axhline(float(baseline_value), color="gray", linestyle="--", linewidth=1.8, label="Fixed Baseline")
+
+    max_mean = max(y_max_candidates) if y_max_candidates else 0.0
+    if metric_type == "HFR":
+        plt.ylim(0.0, max(0.02, 1.2 * max_mean))
+    elif metric_type == "PPR":
+        plt.ylim(0.0, min(1.0, max(0.3, 1.2 * max_mean)))
+    elif metric_type == "EHR":
+        plt.ylim(0.0, 1.05)
+    elif ylim is not None:
+        plt.ylim(ylim[0], ylim[1])
+    elif ylim_bottom is not None:
+        plt.ylim(bottom=ylim_bottom)
+
+    plt.title(title)
+    plt.ylabel(ylabel)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    outdir = f"Result/{folder}/Plots"
+    os.makedirs(outdir, exist_ok=True)
+    plt.savefig(f"{outdir}/{filename}", dpi=300)
+    plt.close()
+
+
+def pad_nan_and_nanmean_std(series):
+    arr = np.asarray(series)
+
+    if arr.dtype != object:
+        arr = np.asarray(arr, dtype=float)
+        if arr.ndim == 1:
+            return arr, np.zeros_like(arr, dtype=float)
+        if arr.ndim == 2:
+            return np.nanmean(arr, axis=0), np.nanstd(arr, axis=0)
+        empty = np.array([], dtype=float)
+        return empty, empty
+
+    seqs = []
+    for x in arr:
+        x_arr = np.asarray(x, dtype=float).reshape(-1)
+        if x_arr.size > 0:
+            seqs.append(x_arr)
+    if not seqs:
+        empty = np.array([], dtype=float)
+        return empty, empty
+
+    max_len = max(len(x) for x in seqs)
+    padded = np.full((len(seqs), max_len), np.nan, dtype=float)
+    for i, x in enumerate(seqs):
+        padded[i, :len(x)] = x
+    return np.nanmean(padded, axis=0), np.nanstd(padded, axis=0)
+
+
+def get_scene_reward_series(data, model_name, scene):
+    prefix = "h" if scene == "Highway" else "u"
+    key_r = f"{model_name}_{prefix}_r"
+    if key_r in data.files:
+        return data[key_r]
+    r2d = np.asarray(data[f"{model_name}_r"], dtype=float)
+    scen2d = np.asarray(data[f"{model_name}_scen"])
+    return scenario_split_from_mask(r2d, scen2d, scene)
+
+
+def plot_fig6_dual_scene(data, models, folder, smooth=100):
+    plt.figure(figsize=(10, 5))
+    model_color = {
+        "DQN (MLP)": "tab:blue",
+        "DQN (LSTM)": "tab:orange",
+    }
+    model_legend = {
+        "DQN (MLP)": "DQN(MLP)",
+        "DQN (LSTM)": "DQN(LSTM)",
+    }
+
+    y_max_candidates = []
+    for m in models:
+        h_series = get_scene_reward_series(data, m, "Highway")
+        u_series = get_scene_reward_series(data, m, "Urban")
+        h_mean, _ = pad_nan_and_nanmean_std(h_series)
+        u_mean, _ = pad_nan_and_nanmean_std(u_series)
+        h_s = smooth_series(h_mean, window=smooth)
+        u_s = smooth_series(u_mean, window=smooth)
+
+        color = model_color.get(m, None)
+        legend_root = model_legend.get(m, m)
+
+        if len(h_s) > 0:
+            plt.plot(h_s, linestyle='-', linewidth=2, color=color, label=f"{legend_root}-Highway")
+            y_max_candidates.append(float(np.nanmax(h_s)))
+        if len(u_s) > 0:
+            plt.plot(u_s, linestyle='--', linewidth=2, color=color, label=f"{legend_root}-Urban")
+            y_max_candidates.append(float(np.nanmax(u_s)))
+
+    
+    if y_max_candidates:
+        y_top = 1.05 * max(y_max_candidates)
+        y_bot = 0.95 * min(y_max_candidates)  # 从实际最低值开始
+        plt.ylim(y_bot, y_top)
+
+    plt.title("Reward Convergence by Scenario")
+    plt.ylabel("Score")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    outdir = f"Result/{folder}/Plots"
+    os.makedirs(outdir, exist_ok=True)
+    plt.savefig(f"{outdir}/Fig6_Reward.png", dpi=300)
+    plt.close()
+
+
+def scenario_split_from_mask(values_2d, scen_2d, target_scene):
+    values_2d = np.asarray(values_2d, dtype=float)
+    scen_2d = np.asarray(scen_2d)
+    seqs = []
+    for s in range(values_2d.shape[0]):
+        mask = (scen_2d[s] == target_scene)
+        seqs.append(values_2d[s][mask])
+    return np.array(seqs, dtype=object)
+
+
+def load_baseline_kpis():
+    path = "Result/Stage1_Baseline/baseline_summary.csv"
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}
+
+    if df.empty:
+        return {}
+
+    row = df.iloc[-1]
+    out = {}
+    for key in ["baseline_hfr", "baseline_ppr", "baseline_ehr"]:
+        if key in df.columns:
+            val = pd.to_numeric(row[key], errors="coerce")
+            if np.isfinite(val):
+                out[key] = float(val)
+    return out
+
+
+def load_baseline_reward_by_sweet_spot():
+    summary_path = "Result/Stage1_Baseline/baseline_summary.csv"
+    metrics_path = "Result/Stage1_Baseline/baseline_metrics.csv"
+    if (not os.path.exists(summary_path)) or (not os.path.exists(metrics_path)):
+        return None, None
+
+    try:
+        summary_df = pd.read_csv(summary_path)
+        metrics_df = pd.read_csv(metrics_path)
+    except Exception:
+        return None, None
+
+    if summary_df.empty:
+        return None, None
+    if "baseline_threshold_dBm" not in summary_df.columns:
+        return None, None
+    required_cols = {"threshold_dBm", "highway_score", "urban_score"}
+    if not required_cols.issubset(set(metrics_df.columns)):
+        return None, None
+
+    threshold = pd.to_numeric(summary_df.iloc[-1]["baseline_threshold_dBm"], errors="coerce")
+    if not np.isfinite(threshold):
+        return None, None
+
+    thresholds = pd.to_numeric(metrics_df["threshold_dBm"], errors="coerce").to_numpy(dtype=float)
+    valid_idx = np.where(np.isfinite(thresholds))[0]
+    if valid_idx.size == 0:
+        return None, None
+
+    close_idx = valid_idx[np.isclose(thresholds[valid_idx], float(threshold), atol=1e-8)]
+    if close_idx.size > 0:
+        idx = int(close_idx[0])
+    else:
+        idx = int(valid_idx[np.argmin(np.abs(thresholds[valid_idx] - float(threshold)))])
+
+    h_base = pd.to_numeric(metrics_df.iloc[idx]["highway_score"], errors="coerce")
+    u_base = pd.to_numeric(metrics_df.iloc[idx]["urban_score"], errors="coerce")
+    if (not np.isfinite(h_base)) or (not np.isfinite(u_base)):
+        return None, None
+    return float(h_base), float(u_base)
+
+
+def block_mean_per_seed(obj_series, block_size=200):
+    arr = np.asarray(obj_series, dtype=object)
+    block_seqs = []
+    for seq in arr:
+        x = np.asarray(seq, dtype=float).reshape(-1)
+        if x.size == 0:
+            continue
+        n_blocks = int(np.ceil(x.size / block_size))
+        block_vals = []
+        for i in range(n_blocks):
+            seg = x[i * block_size:(i + 1) * block_size]
+            if seg.size > 0:
+                block_vals.append(float(np.mean(seg)))
+        if block_vals:
+            block_seqs.append(np.asarray(block_vals, dtype=float))
+    return np.array(block_seqs, dtype=object)
+
+
+def plot_fig9_reward_gain_blockwise(data, models, folder, highway_baseline, urban_baseline, block_size=200):
+    for scene, prefix, baseline in [
+        ("Highway", "h", highway_baseline),
+        ("Urban", "u", urban_baseline),
+    ]:
+        plt.figure(figsize=(10, 5))
+        for m in models:
+            key_r = f"{m}_{prefix}_r"
+            if key_r in data.files:
+                scen_reward = data[key_r]
+            else:
+                r2d = np.asarray(data[f"{m}_r"], dtype=float)
+                scen2d = np.asarray(data[f"{m}_scen"])
+                scen_reward = scenario_split_from_mask(r2d, scen2d, scene)
+
+            block_series = block_mean_per_seed(scen_reward, block_size=block_size)
+            mean_curve, _ = pad_nan_and_nanmean_std(block_series)
+            if len(mean_curve) == 0:
+                continue
+            gain_curve = mean_curve - float(baseline)
+            gain_s = rolling_mean(gain_curve, window=3)
+            plt.plot(gain_s, linewidth=2, label=m)
+
+        plt.title(f"Block-wise {scene} Reward Gain")
+        plt.xlabel("Block Index (each block = 200 episodes)")
+        plt.ylabel("Reward Gain")
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        outdir = f"Result/{folder}/Plots"
+        os.makedirs(outdir, exist_ok=True)
+        plt.savefig(f"{outdir}/Fig9_{scene}_Reward.png", dpi=300)
+        plt.close()
+
+
+def main():
+    folders = [f for f in os.listdir("Result")
+               if f.startswith("Tournament_10k_") or f.startswith("Tournament_8000_") or f.startswith("Tournament_Parallel")]
+    if not folders:
+        print("No tournament folders found.")
+        return
+    folder = sorted(folders)[-1]
+
+    data_path = f"Result/{folder}/raw_evidence.npz"
+    if not os.path.exists(data_path):
+        print(f"Missing raw_evidence.npz in {folder}")
+        return
+
+    data = np.load(data_path, allow_pickle=True)
+    models = ["DQN (MLP)", "DQN (LSTM)"]
+
+    print(f"Generating Fig 6-12 for {folder}...")
+    baseline_kpis = load_baseline_kpis()
+    highway_baseline, urban_baseline = load_baseline_reward_by_sweet_spot()
+
+    plot_fig6_dual_scene(data, models, folder, smooth=100)
+    plot_and_save(
+        {m: data[f"{m}_hfr"] for m in models},
+        "Handover Failure Rate (HFR) Trend", "Rate", "Fig7a_HFR.png", folder,
+        smooth=100, metric_type="HFR", baseline_value=baseline_kpis.get("baseline_hfr")
+    )
+    plot_and_save(
+        {m: data[f"{m}_ppr"] for m in models},
+        "Ping-pong Rate (PPR) Trend", "Rate", "Fig7b_PPR.png", folder,
+        smooth=100, metric_type="PPR", baseline_value=baseline_kpis.get("baseline_ppr")
+    )
+    plot_and_save(
+        {m: data[f"{m}_ehr"] for m in models},
+        "Effective Handover Rate (EHR) Trend", "Percentage", "Fig8_EHR.png", folder,
+        smooth=100, metric_type="EHR", baseline_value=baseline_kpis.get("baseline_ehr")
+    )
+
+    if (highway_baseline is None) or (urban_baseline is None):
+        print("Missing Stage1 baseline reward for Fig9 reward gain; skip Fig9.")
+    else:
+        plot_fig9_reward_gain_blockwise(
+            data,
+            models,
+            folder,
+            highway_baseline=highway_baseline,
+            urban_baseline=urban_baseline,
+            block_size=200,
+        )
+
+    for scene, prefix in [("Highway", "h"), ("Urban", "u")]:
+        scen_ehr = {}
+        for m in models:
+            key_ehr = f"{m}_{prefix}_ehr"
+
+            if key_ehr in data.files:
+                scen_ehr[m] = data[key_ehr]
+            else:
+                ehr2d = np.asarray(data[f"{m}_ehr"], dtype=float)
+                scen2d = np.asarray(data[f"{m}_scen"])
+                scen_ehr[m] = scenario_split_from_mask(ehr2d, scen2d, scene)
+
+        plot_and_save(
+            scen_ehr,
+            f"{scene} EHR Trend", "EHR", f"Fig12_{scene}_EHR.png", folder,
+            smooth=100, metric_type="EHR", baseline_value=baseline_kpis.get("baseline_ehr")
+        )
+
+    print("Fig 6-12 Trends Generated successfully.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+#04_bar_and_leap.py
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+
+def find_latest_tournament_folder():
+    prefixes = ("Tournament_10k_", "Tournament_8000_", "Tournament_Parallel")
+    if not os.path.isdir("Result"):
+        return None
+    folders = [f for f in os.listdir("Result")
+               if os.path.isdir(f"Result/{f}") and f.startswith(prefixes)]
+    if not folders:
+        return None
+    return sorted(folders)[-1]
+
+
+def load_stage1_baseline_files():
+    metrics_path = "Result/Stage1_Baseline/baseline_metrics.csv"
+    summary_path = "Result/Stage1_Baseline/baseline_summary.csv"
+    metrics_df = None
+    summary_row = None
+
+    if os.path.exists(metrics_path):
+        tmp = pd.read_csv(metrics_path)
+        required = {"threshold_dBm", "highway_score", "urban_score"}
+        if required.issubset(set(tmp.columns)):
+            metrics_df = tmp
+        else:
+            print(f"[Warn] baseline_metrics.csv missing columns: {sorted(required - set(tmp.columns))}")
+
+    if os.path.exists(summary_path):
+        tmp = pd.read_csv(summary_path)
+        required = {"best_highway_score", "best_urban_score", "best_highway_threshold", "best_urban_threshold"}
+        if len(tmp) > 0 and required.issubset(set(tmp.columns)):
+            summary_row = tmp.iloc[0]
+        else:
+            print(f"[Warn] baseline_summary.csv missing columns: {sorted(required - set(tmp.columns))}")
+
+    return metrics_df, summary_row, metrics_path, summary_path
+
+
+def get_baseline_kpi_from_summary(summary_row):
+    if summary_row is None:
+        return None
+    for c_hfr, c_ppr, c_ehr in [
+        ("baseline_hfr", "baseline_ppr", "baseline_ehr"),
+        ("HFR", "PPR", "EHR"),
+    ]:
+        if all(c in summary_row.index for c in [c_hfr, c_ppr, c_ehr]):
+            return float(summary_row[c_hfr]), float(summary_row[c_ppr]), float(summary_row[c_ehr])
+    return None
+
+
+def to_percent_scalar(v):
+    v = float(v)
+    return v * 100.0 if abs(v) <= 1.5 else v
+
+
+def get_model_value(df, model_name, column):
+    rows = df.loc[df["Model"] == model_name, column]
+    if len(rows) == 0:
+        return np.nan
+    return float(rows.iloc[0])
+
+
+def plot_three_bar(title, ylabel, baseline_val, mlp_val, lstm_val, filename, higher_is_better=True):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    models = ["Fixed\nBaseline", "DQN\n(MLP)", "DQN\n(LSTM)"]
+    values = [baseline_val, mlp_val, lstm_val]
+    colors = ['#888888', '#1f77b4', '#ff7f0e']
+    bars = ax.bar(models, values, color=colors, width=0.5, edgecolor='black', linewidth=0.8)
+
+    finite_vals = [v for v in values if np.isfinite(v)]
+    top = max(finite_vals) if finite_vals else 1.0
+    text_off = top * 0.01 if top > 0 else 0.01
+
+    for bar, val in zip(bars, values):
+        if np.isfinite(val):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + text_off,
+                f"{val:.2f}%",
+                ha='center',
+                va='bottom',
+                fontsize=11,
+                fontweight='bold'
+            )
+
+    ax.set_title(title, fontsize=13)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.set_ylim(0, max(top * 1.2, 1.0))
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def main():
+    folder = find_latest_tournament_folder()
+    if folder is None:
+        print("No tournament folders found (expected prefixes: Tournament_10k_, Tournament_8000_, Tournament_Parallel).")
+        return
+
+    plots_dir = f"Result/{folder}/Plots"
+    os.makedirs(plots_dir, exist_ok=True)
+
+    df_path = f"Result/{folder}/final_leaderboard.csv"
+    if not os.path.exists(df_path):
+        print(f"Missing final_leaderboard.csv in {folder}")
+        return
+    df = pd.read_csv(df_path)
+    required_ai_cols = {"Model", "Highway Score", "Urban Score"}
+    if not required_ai_cols.issubset(set(df.columns)):
+        print(f"Missing required columns in final_leaderboard.csv: {sorted(required_ai_cols - set(df.columns))}")
+        return
+
+    metrics_df, summary_row, metrics_path, summary_path = load_stage1_baseline_files()
+
+    fallback_hfr, fallback_ppr, fallback_ehr = 0.15, 0.12, 0.725
+    baseline_kpi = get_baseline_kpi_from_summary(summary_row)
+    if baseline_kpi is not None:
+        baseline_hfr, baseline_ppr, baseline_ehr = baseline_kpi
+        print(f"Loaded KPI baseline from: {summary_path}")
+    else:
+        baseline_hfr, baseline_ppr, baseline_ehr = fallback_hfr, fallback_ppr, fallback_ehr
+        if summary_row is not None:
+            print(f"[Warn] {summary_path} found but KPI columns missing; fallback to hardcoded KPI baseline.")
+        else:
+            print("[Warn] Stage1 baseline summary not found; fallback to hardcoded KPI baseline.")
+
+    mlp_ppr = get_model_value(df, "DQN (MLP)", "PPR")
+    lstm_ppr = get_model_value(df, "DQN (LSTM)", "PPR")
+    mlp_hfr = get_model_value(df, "DQN (MLP)", "HFR")
+    lstm_hfr = get_model_value(df, "DQN (LSTM)", "HFR")
+    mlp_ehr = get_model_value(df, "DQN (MLP)", "EHR")
+    lstm_ehr = get_model_value(df, "DQN (LSTM)", "EHR")
+
+    plot_three_bar(
+        title="Final PPR Comparison",
+        ylabel="Rate (%)",
+        baseline_val=to_percent_scalar(baseline_ppr),
+        mlp_val=to_percent_scalar(mlp_ppr),
+        lstm_val=to_percent_scalar(lstm_ppr),
+        filename=f"{plots_dir}/Fig13_PPR_Bar.png",
+        higher_is_better=False,
+    )
+    plot_three_bar(
+        title="Final HFR Comparison",
+        ylabel="Rate (%)",
+        baseline_val=to_percent_scalar(baseline_hfr),
+        mlp_val=to_percent_scalar(mlp_hfr),
+        lstm_val=to_percent_scalar(lstm_hfr),
+        filename=f"{plots_dir}/Fig14_HFR_Bar.png",
+        higher_is_better=False,
+    )
+    plot_three_bar(
+        title="Final EHR Comparison",
+        ylabel="Effectiveness (%)",
+        baseline_val=to_percent_scalar(baseline_ehr),
+        mlp_val=to_percent_scalar(mlp_ehr),
+        lstm_val=to_percent_scalar(lstm_ehr),
+        filename=f"{plots_dir}/Fig15_EHR_Bar.png",
+        higher_is_better=True,
+    )
+
+    plt.figure(figsize=(9, 7))
+
+    x_pool, y_pool = [], []
+    if metrics_df is not None:
+        bx = np.asarray(metrics_df["highway_score"], dtype=float)
+        by = np.asarray(metrics_df["urban_score"], dtype=float)
+        if bx.size > 0 and by.size > 0:
+            plt.plot(bx, by, 'b--', alpha=0.35, label='Static baseline envelope')
+            plt.scatter(bx, by, s=45, alpha=0.35, color='tab:blue', edgecolors='none')
+            x_pool.append(bx)
+            y_pool.append(by)
+            print(f"Loaded static baseline points from: {metrics_path}")
+
+    ai_points = df.loc[:, ["Model", "Highway Score", "Urban Score"]].copy()
+    ai_points["Highway Score"] = pd.to_numeric(ai_points["Highway Score"], errors="coerce")
+    ai_points["Urban Score"] = pd.to_numeric(ai_points["Urban Score"], errors="coerce")
+
+    for _, row in ai_points.iterrows():
+        plt.scatter(
+            row['Highway Score'],
+            row['Urban Score'],
+            s=600,
+            marker='*',
+            edgecolors='black',
+            label=f"AI: {row['Model']}"
+        )
+        plt.annotate(
+            row['Model'],
+            (row['Highway Score'], row['Urban Score']),
+            xytext=(10, 10),
+            textcoords='offset points',
+            weight='bold'
+        )
+
+    ai_x = np.asarray(ai_points['Highway Score'].values, dtype=float)
+    ai_y = np.asarray(ai_points['Urban Score'].values, dtype=float)
+    x_pool.append(ai_x)
+    y_pool.append(ai_y)
+
+    x_list = [arr[np.isfinite(arr)] for arr in x_pool if arr.size > 0]
+    y_list = [arr[np.isfinite(arr)] for arr in y_pool if arr.size > 0]
+    x_all = np.concatenate(x_list) if x_list else np.array([])
+    y_all = np.concatenate(y_list) if y_list else np.array([])
+    if x_all.size > 0 and y_all.size > 0:
+        pad_x = (x_all.max() - x_all.min()) * 0.15 + 1e-6
+        pad_y = (y_all.max() - y_all.min()) * 0.15 + 1e-6
+        plt.xlim(x_all.min() - pad_x, x_all.max() + pad_x)
+        plt.ylim(y_all.min() - pad_y, y_all.max() + pad_y)
+
+    plt.xlabel("Highway Score")
+    plt.ylabel("Urban Score")
+    plt.title("Pareto Envelope and AI Adaptation")
+    plt.legend(loc='lower left')
+    plt.grid(True, linestyle=':', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(f"{plots_dir}/05_Ultimate_Leap.png", dpi=300)
+    plt.close()
+
+    print("ALL EXPERIMENTS COMPLETE!")
+    print("Fig 13-15 and Ultimate Leap Generated.")
+
+
+if __name__ == "__main__":
+    main()
+
+

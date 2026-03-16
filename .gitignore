@@ -1,0 +1,22 @@
+# cache
+__pycache__/
+*.pyc
+
+# vscode
+.vscode/
+
+# results
+Result/
+
+# model / logs / generated files
+*.npz
+*.png
+*.jpg
+*.jpeg
+*.pt
+*.pth
+*.log
+
+# system
+.DS_Store
+Thumbs.db
