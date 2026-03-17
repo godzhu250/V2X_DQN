@@ -74,6 +74,68 @@ def run_train_episode(env, agent, ep=None):
     }
 
 
+def run_eval_episode(env, agent, checkpoint_ep):
+    if hasattr(agent, "state_sequence"):
+        agent.state_sequence.clear()
+
+    env.set_episode(checkpoint_ep)
+    state = env.reset()
+    done = False
+    total_reward = 0.0
+
+    while not done:
+        action = agent.select_action(state, is_training=False)
+        next_state, reward, done, _ = env.step(action)
+        state = next_state
+        total_reward += float(reward)
+
+    stats = env.get_episode_stats()
+    return {
+        "reward": float(total_reward),
+        "ho_attempted": int(stats["ho_attempted"]),
+        "ho_success": int(stats["ho_success"]),
+        "ho_failed": int(stats["ho_failed"]),
+        "pingpong": int(stats["pingpong"]),
+        "weak_signal_event": int(stats["weak_signal_event"]),
+        "no_attempt_episode": int(stats["no_attempt_episode"]),
+        "hfr": float(stats["hfr"]),
+        "ppr": float(stats["ppr"]),
+        "ehr": float(stats["ehr"]),
+    }
+
+
+def evaluate_checkpoint(env, agent, checkpoint_ep, eval_episodes):
+    rows = [run_eval_episode(env, agent, checkpoint_ep) for _ in range(int(eval_episodes))]
+    df = pd.DataFrame(rows)
+
+    total_attempted = int(df["ho_attempted"].sum())
+    total_failed = int(df["ho_failed"].sum())
+    total_pingpong = int(df["pingpong"].sum())
+
+    aggregate_hfr = total_failed / max(total_attempted, 1)
+    aggregate_ppr = total_pingpong / max(total_attempted, 1)
+    aggregate_ehr = 1.0 - aggregate_hfr - aggregate_ppr
+
+    return {
+        "checkpoint_episode": int(checkpoint_ep),
+        "eval_episodes": int(eval_episodes),
+        "reward": float(df["reward"].mean()),
+        "hfr": float(df["hfr"].mean()),
+        "ppr": float(df["ppr"].mean()),
+        "ehr": float(df["ehr"].mean()),
+        "aggregate_hfr": float(aggregate_hfr),
+        "aggregate_ppr": float(aggregate_ppr),
+        "aggregate_ehr": float(aggregate_ehr),
+        "total_ho_attempted": int(total_attempted),
+        "total_ho_success": int(df["ho_success"].sum()),
+        "total_ho_failed": int(total_failed),
+        "total_pingpong": int(total_pingpong),
+        "total_weak_signal_event": int(df["weak_signal_event"].sum()),
+        "no_attempt_episode_count": int(df["no_attempt_episode"].sum()),
+        "no_attempt_episode_ratio": float(df["no_attempt_episode"].mean()),
+    }
+
+
 def summarize_seed(df, scenario, model_name, model_tag, seed):
     total_attempted = int(df["ho_attempted"].sum())
     total_success = int(df["ho_success"].sum())
@@ -186,6 +248,7 @@ def run_training(scenario, seeds, episodes, output_dir):
 
     all_seed_rows = []
     all_model_rows = []
+    all_eval_rows = []
 
     for model_name, model_tag, agent_cls in MODEL_SPECS:
         print(f"[Train][{scenario}] model={model_name}")
@@ -198,7 +261,9 @@ def run_training(scenario, seeds, episodes, output_dir):
             agent = agent_cls()
 
             episode_rows = []
+            eval_rows = []
             for ep in range(1, int(episodes) + 1):
+                env.set_episode(ep)
                 row = run_train_episode(env, agent, ep=ep)
                 row["episode"] = ep
                 episode_rows.append(row)
@@ -211,6 +276,29 @@ def run_training(scenario, seeds, episodes, output_dir):
                         f"  seed={seed} ep={ep}/{episodes} "
                         f"reward={row['reward']:.3f} hfr={row['hfr']:.4f} "
                         f"ppr={row['ppr']:.4f} ehr={row['ehr']:.4f}"
+                    )
+
+                if ep % config.EVAL_INTERVAL_EPISODES == 0 or ep == int(episodes):
+                    eval_row = evaluate_checkpoint(
+                        env=env,
+                        agent=agent,
+                        checkpoint_ep=ep,
+                        eval_episodes=config.EVAL_EPISODES,
+                    )
+                    eval_row.update(
+                        {
+                            "scenario": scenario,
+                            "model": model_name,
+                            "model_tag": model_tag,
+                            "seed": int(seed),
+                        }
+                    )
+                    eval_rows.append(eval_row)
+                    all_eval_rows.append(eval_row)
+                    print(
+                        f"    eval@ep={ep} reward={eval_row['reward']:.3f} "
+                        f"hfr={eval_row['hfr']:.4f} ppr={eval_row['ppr']:.4f} "
+                        f"ehr={eval_row['ehr']:.4f}"
                     )
 
             ep_df = pd.DataFrame(episode_rows).sort_values("episode").reset_index(drop=True)
@@ -229,6 +317,18 @@ def run_training(scenario, seeds, episodes, output_dir):
                 index=False,
             )
             print(f"[Train] Seed {seed} results saved to {seed_file}")
+
+            if eval_rows:
+                eval_df_seed = pd.DataFrame(eval_rows).sort_values("checkpoint_episode").reset_index(drop=True)
+                eval_seed_file = os.path.join(output_dir, f"seed_{seed}_eval_trend.csv")
+                file_exists_eval = os.path.exists(eval_seed_file)
+                eval_df_seed.to_csv(
+                    eval_seed_file,
+                    mode="a" if file_exists_eval else "w",
+                    header=not file_exists_eval,
+                    index=False,
+                )
+                print(f"[Eval] Seed {seed} trend saved to {eval_seed_file}")
 
             sys.stdout.flush()
             if hasattr(os, "sync"):
@@ -267,6 +367,31 @@ def run_training(scenario, seeds, episodes, output_dir):
 
     model_summary_df = pd.DataFrame(all_model_rows)
     model_summary_df.to_csv(os.path.join(output_dir, "model_summary.csv"), index=False)
+
+    if all_eval_rows:
+        eval_df = pd.DataFrame(all_eval_rows)
+        model_eval_trend_df = (
+            eval_df.groupby(
+                ["scenario", "model", "model_tag", "checkpoint_episode"],
+                as_index=False,
+            )
+            .agg(
+                reward=("reward", "mean"),
+                hfr=("hfr", "mean"),
+                ppr=("ppr", "mean"),
+                ehr=("ehr", "mean"),
+                aggregate_hfr=("aggregate_hfr", "mean"),
+                aggregate_ppr=("aggregate_ppr", "mean"),
+                aggregate_ehr=("aggregate_ehr", "mean"),
+                no_attempt_episode_ratio=("no_attempt_episode_ratio", "mean"),
+                eval_episodes=("eval_episodes", "sum"),
+            )
+            .sort_values(["model", "checkpoint_episode"])
+            .reset_index(drop=True)
+        )
+        model_eval_trend_path = os.path.join(output_dir, "model_eval_trend.csv")
+        model_eval_trend_df.to_csv(model_eval_trend_path, index=False)
+        print(f"Saved: {model_eval_trend_path}")
 
     print(f"Saved: {os.path.join(output_dir, 'seed_summary.csv')}")
     print(f"Saved: {os.path.join(output_dir, 'model_summary.csv')}")

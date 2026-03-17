@@ -1,5 +1,7 @@
 ﻿import numpy as np
 
+import math
+
 import config
 
 
@@ -29,6 +31,7 @@ class VehicleEnv:
         self.time_step = 0
         self.last_success_ho_time = -10**9
         self.steps_since_last_ho = 0
+        self.current_episode = 0
         self.current_relay_id = 0
         self.prev_relay_id_before_last_success_ho = None
 
@@ -57,6 +60,9 @@ class VehicleEnv:
         self.shadowing_std = float(profile["shadowing_std_db"])
         self.ue_speed = float(profile["speed_mps"])
 
+    def set_episode(self, episode):
+        self.current_episode = int(episode)
+
     def reset(self, force_scenario=None):
         if force_scenario is not None:
             self.scenario_type = self._validate_scenario(force_scenario)
@@ -81,7 +87,7 @@ class VehicleEnv:
             "validation_failure": 0,
         }
 
-        self.ue_relative_x = np.random.uniform(0.0, 50.0)
+        self.ue_relative_x = np.random.uniform(0.0, self.inter_relay_dist * 0.8)
         self.current_rsrp = self._calculate_physics_rsrp(self.ue_relative_x)
         self.last_rsrp = self.current_rsrp
 
@@ -110,6 +116,8 @@ class VehicleEnv:
         dist_target = self._distance_to_relay(target_relay_id)
         rsrp_serving = self._calculate_physics_rsrp(dist_serving)
         rsrp_target = self._calculate_physics_rsrp(dist_target)
+        rsrp_serving += np.random.normal(0.0, config.RSRP_NOISE_STD_DB)
+        rsrp_target += np.random.normal(0.0, config.RSRP_NOISE_STD_DB)
         return rsrp_serving, rsrp_target
 
     def _target_condition(self, rsrp_serving, rsrp_target):
@@ -271,15 +279,19 @@ class VehicleEnv:
         reward -= config.REWARD_WEAK_SIGNAL * weak_signal_event
         reward += config.REWARD_ALIVE
 
-        if (
-            rsrp_serving < config.STAGNATION_RSRP_THRESHOLD_DBM
-            and self.steps_since_last_ho > config.STAGNATION_START_STEPS
-        ):
-            stagnation_term = (self.steps_since_last_ho - config.STAGNATION_START_STEPS) / max(
-                1.0,
-                config.STAGNATION_NORMALIZER,
+        stagnation_penalty = 0.0
+        stagnation_threshold_steps = getattr(
+            config,
+            "STAGNATION_THRESHOLD_STEPS",
+            config.STAGNATION_START_STEPS,
+        )
+        if self.steps_since_last_ho > stagnation_threshold_steps:
+            decay_factor = math.exp(
+                -self.current_episode / config.STAGNATION_DECAY_EPISODES
             )
-            reward -= config.REWARD_STAGNATION * min(stagnation_term, 1.0)
+            stagnation_penalty = config.STAGNATION_PENALTY_BASE * decay_factor
+
+        reward -= stagnation_penalty
 
         self.current_rsrp = rsrp_serving
         self.time_step += 1

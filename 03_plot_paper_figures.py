@@ -1,5 +1,4 @@
 ﻿import argparse
-import glob
 import json
 import os
 
@@ -48,33 +47,11 @@ def moving_average(x, window):
     return series.rolling(window=window, min_periods=1).mean().to_numpy(dtype=float)
 
 
-def _find_files(train_dir, file_tags):
-    for tag in file_tags:
-        paths = sorted(glob.glob(os.path.join(train_dir, f"{tag}_seed*.csv")))
-        if paths:
-            return paths
-    return []
-
-
-def load_mean_curve(train_dir, file_tags, metric):
-    paths = _find_files(train_dir, file_tags)
-    if not paths:
-        return np.array([]), []
-
-    curves = []
-    for path in paths:
-        df = pd.read_csv(path)
-        if metric not in df.columns:
-            continue
-        curves.append(df[metric].to_numpy(dtype=float))
-
-    if not curves:
-        return np.array([]), paths
-
-    min_len = min(len(c) for c in curves)
-    arr = np.array([c[:min_len] for c in curves], dtype=float)
-    mean_curve = pd.DataFrame(arr).mean(axis=0, skipna=True).to_numpy(dtype=float)
-    return mean_curve, paths
+def load_model_eval_trend(train_dir):
+    path = os.path.join(train_dir, "model_eval_trend.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing evaluation trend file: {path}")
+    return pd.read_csv(path)
 
 
 def load_baseline(baseline_dir):
@@ -85,30 +62,38 @@ def load_baseline(baseline_dir):
         return json.load(f)
 
 
-def load_model_summary(train_dir):
-    path = os.path.join(train_dir, "model_summary.csv")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing model summary file: {path}")
-    return pd.read_csv(path)
-
-
-def _get_model_row(model_summary_df, aliases):
+def get_tail_eval_value(eval_trend_df, aliases, metric_col, tail_k=3):
+    rows = pd.DataFrame()
     for alias in aliases:
-        rows = model_summary_df[model_summary_df["model"] == alias]
-        if not rows.empty:
-            return rows.iloc[0]
-    raise ValueError(f"No model row found for aliases: {aliases}")
+        candidate = eval_trend_df[eval_trend_df["model"] == alias]
+        if not candidate.empty:
+            rows = candidate
+            break
+
+    if rows.empty:
+        raise ValueError(
+            f"No eval trend rows found for aliases={aliases} in model_eval_trend.csv"
+        )
+
+    if metric_col not in rows.columns:
+        raise ValueError(
+            f"Metric column '{metric_col}' not found in model_eval_trend.csv"
+        )
+
+    rows = rows.sort_values("checkpoint_episode")
+    tail_rows = rows.tail(max(1, int(tail_k)))
+    return float(tail_rows[metric_col].mean(skipna=True))
 
 
-def plot_trend(fig_dir, file_name, title, ylabel, curves, baseline_value, smooth_window):
+def plot_trend(fig_dir, file_name, title, ylabel, x_curves, y_curves, baseline_value, smooth_window):
     plt.figure(figsize=(10, 5))
 
     for spec in MODEL_SPECS:
-        curve = curves.get(spec["label"], np.array([]))
+        x = x_curves.get(spec["label"], np.array([]))
+        curve = y_curves.get(spec["label"], np.array([]))
         if curve.size == 0:
             continue
         smooth = moving_average(curve, smooth_window)
-        x = np.arange(1, len(curve) + 1)
         plt.plot(x, smooth, color=spec["color"], linewidth=2.0, label=spec["label"])
 
     plt.axhline(
@@ -129,16 +114,13 @@ def plot_trend(fig_dir, file_name, title, ylabel, curves, baseline_value, smooth
     plt.close()
 
 
-def plot_metric_bar(fig_dir, file_name, title, metric_name, baseline_value, model_summary_df):
+def plot_metric_bar(fig_dir, file_name, title, ylabel, baseline_value, dqn_value, lstm_value):
     methods = ["Best Fixed Baseline", "DQN (MLP)", "LSTM-DQN"]
-
-    dqn_row = _get_model_row(model_summary_df, ["DQN (MLP)"])
-    lstm_row = _get_model_row(model_summary_df, ["LSTM-DQN", "DRQN (LSTM)"])
 
     values = [
         float(baseline_value),
-        float(dqn_row[metric_name]),
-        float(lstm_row[metric_name]),
+        float(dqn_value),
+        float(lstm_value),
     ]
 
     colors = ["#888888", "red", "blue"]
@@ -158,7 +140,7 @@ def plot_metric_bar(fig_dir, file_name, title, metric_name, baseline_value, mode
         )
 
     plt.title(title)
-    plt.ylabel(metric_name.replace("aggregate_", "").upper())
+    plt.ylabel(ylabel)
     plt.grid(axis="y", alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(fig_dir, file_name), dpi=300)
@@ -178,36 +160,41 @@ def main():
     os.makedirs(fig_dir, exist_ok=True)
 
     baseline = load_baseline(baseline_dir)
-    model_summary_df = load_model_summary(train_dir)
+    eval_trend_df = load_model_eval_trend(train_dir)
 
     reward_curves = {}
     hfr_curves = {}
     ppr_curves = {}
     ehr_curves = {}
+    x_curves = {}
 
     for spec in MODEL_SPECS:
-        reward_curve, paths = load_mean_curve(train_dir, spec["file_tags"], "reward")
-        hfr_curve, _ = load_mean_curve(train_dir, spec["file_tags"], "hfr")
-        ppr_curve, _ = load_mean_curve(train_dir, spec["file_tags"], "ppr")
-        ehr_curve, _ = load_mean_curve(train_dir, spec["file_tags"], "ehr")
+        rows = pd.DataFrame()
+        for alias in spec["summary_aliases"]:
+            candidate = eval_trend_df[eval_trend_df["model"] == alias]
+            if not candidate.empty:
+                rows = candidate
+                break
 
-        if not paths:
-            raise FileNotFoundError(
-                f"No per-seed training files found for {spec['label']} in {train_dir}. "
-                f"Expected tags: {spec['file_tags']}"
+        if rows.empty:
+            raise ValueError(
+                f"No eval trend rows found for {spec['label']} in model_eval_trend.csv"
             )
+        rows = rows.sort_values("checkpoint_episode")
 
-        reward_curves[spec["label"]] = reward_curve
-        hfr_curves[spec["label"]] = hfr_curve
-        ppr_curves[spec["label"]] = ppr_curve
-        ehr_curves[spec["label"]] = ehr_curve
+        x_curves[spec["label"]] = rows["checkpoint_episode"].to_numpy(dtype=float)
+        reward_curves[spec["label"]] = rows["reward"].to_numpy(dtype=float)
+        hfr_curves[spec["label"]] = rows["hfr"].to_numpy(dtype=float)
+        ppr_curves[spec["label"]] = rows["ppr"].to_numpy(dtype=float)
+        ehr_curves[spec["label"]] = rows["ehr"].to_numpy(dtype=float)
 
     plot_trend(
         fig_dir=fig_dir,
         file_name="fig_reward_trend.png",
         title=f"{scenario_title} Reward Trend",
         ylabel="Reward",
-        curves=reward_curves,
+        x_curves=x_curves,
+        y_curves=reward_curves,
         baseline_value=float(baseline["mean_reward"]),
         smooth_window=args.smooth_window,
     )
@@ -216,7 +203,8 @@ def main():
         file_name="fig_hfr_trend.png",
         title=f"{scenario_title} HFR Trend (no-attempt episodes excluded)",
         ylabel="HFR",
-        curves=hfr_curves,
+        x_curves=x_curves,
+        y_curves=hfr_curves,
         baseline_value=float(baseline["aggregate_hfr"]),
         smooth_window=args.smooth_window,
     )
@@ -225,7 +213,8 @@ def main():
         file_name="fig_ppr_trend.png",
         title=f"{scenario_title} PPR Trend (no-attempt episodes excluded)",
         ylabel="PPR",
-        curves=ppr_curves,
+        x_curves=x_curves,
+        y_curves=ppr_curves,
         baseline_value=float(baseline["aggregate_ppr"]),
         smooth_window=args.smooth_window,
     )
@@ -234,7 +223,8 @@ def main():
         file_name="fig_ehr_trend.png",
         title=f"{scenario_title} EHR Trend (no-attempt episodes excluded)",
         ylabel="EHR",
-        curves=ehr_curves,
+        x_curves=x_curves,
+        y_curves=ehr_curves,
         baseline_value=float(baseline["aggregate_ehr"]),
         smooth_window=args.smooth_window,
     )
@@ -242,26 +232,29 @@ def main():
     plot_metric_bar(
         fig_dir=fig_dir,
         file_name="fig_hfr_bar.png",
-        title=f"{scenario_title} Final HFR Comparison",
-        metric_name="aggregate_hfr",
+        title=f"{scenario_title} Late-Stage HFR Comparison",
+        ylabel="HFR",
         baseline_value=float(baseline["aggregate_hfr"]),
-        model_summary_df=model_summary_df,
+        dqn_value=get_tail_eval_value(eval_trend_df, ["DQN (MLP)"], "hfr", tail_k=3),
+        lstm_value=get_tail_eval_value(eval_trend_df, ["LSTM-DQN", "DRQN (LSTM)"], "hfr", tail_k=3),
     )
     plot_metric_bar(
         fig_dir=fig_dir,
         file_name="fig_ppr_bar.png",
-        title=f"{scenario_title} Final PPR Comparison",
-        metric_name="aggregate_ppr",
+        title=f"{scenario_title} Late-Stage PPR Comparison",
+        ylabel="PPR",
         baseline_value=float(baseline["aggregate_ppr"]),
-        model_summary_df=model_summary_df,
+        dqn_value=get_tail_eval_value(eval_trend_df, ["DQN (MLP)"], "ppr", tail_k=3),
+        lstm_value=get_tail_eval_value(eval_trend_df, ["LSTM-DQN", "DRQN (LSTM)"], "ppr", tail_k=3),
     )
     plot_metric_bar(
         fig_dir=fig_dir,
         file_name="fig_ehr_bar.png",
-        title=f"{scenario_title} Final EHR Comparison",
-        metric_name="aggregate_ehr",
+        title=f"{scenario_title} Late-Stage EHR Comparison",
+        ylabel="EHR",
         baseline_value=float(baseline["aggregate_ehr"]),
-        model_summary_df=model_summary_df,
+        dqn_value=get_tail_eval_value(eval_trend_df, ["DQN (MLP)"], "ehr", tail_k=3),
+        lstm_value=get_tail_eval_value(eval_trend_df, ["LSTM-DQN", "DRQN (LSTM)"], "ehr", tail_k=3),
     )
 
     print(f"Saved figures to: {fig_dir}")

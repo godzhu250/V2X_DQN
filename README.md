@@ -36,6 +36,7 @@ Per-episode KPI:
   - `EHR = 1 - HFR - PPR`
 
 So no-attempt episodes are excluded from per-episode KPI interpretation.
+No-attempt episodes keep NaN semantics and are not remapped to 0.5/1.0.
 
 Aggregate KPI (used for final bars):
 - `aggregate_HFR = sum(ho_failed) / sum(ho_attempted)`
@@ -85,14 +86,27 @@ To avoid overly idealized instant stabilization after success:
 
 This is a minimal correction to make validation-based dynamics more realistic.
 
+## Trend Source
+
+Trend figures are generated from checkpoint evaluation trends, not raw training episodes:
+- per-seed: `seed_<seed>_eval_trend.csv`
+- model-level plotting source: `model_eval_trend.csv`
+
+This keeps paper-style trend curves stable while preserving KPI semantics.
+
 ## Sensitivity and Calibration
 
 - `TTT_SECONDS = 0.3`
 - `TTT_STEPS = int(round(TTT_SECONDS / SIM_STEP_SECONDS))`
 - `BASELINE_MIN_TOTAL_ATTEMPTS = 20`
-- `PINGPONG_WINDOW_STEPS = 20`
+- `PINGPONG_WINDOW_STEPS = 150`
 - `WEAK_SIGNAL_THRESHOLD_DBM = -105.0` (calibrated to avoid all-zero weak-signal stats)
 - `TARGET_RSRP_FAIL_THRESHOLD_DBM = -80.0` (stricter validation to avoid instant-success bias)
+- Highway difficulty is mildly increased for non-trivial policies:
+  - `inter_relay_dist_m = 1400.0`
+  - `shadowing_std_db = 6.0`
+- UE initial position is randomized over a wider range at reset:
+  - `ue_relative_x ~ Uniform(0, 0.8 * inter_relay_dist)`
 
 ## Baseline Selection Rule
 

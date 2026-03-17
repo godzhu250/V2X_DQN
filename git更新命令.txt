@@ -4,3 +4,5 @@ git push
 
 
 -m后边是说明本次改动
+
+git commit -m "small update"

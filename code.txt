@@ -1,19 +1,3 @@
-##readme.md
-# V2X_DQN (Single-Scenario Refactor)
-
-This project now uses a clean single-scenario DRL pipeline for SL-RSRP threshold adaptation:
-- Highway-only experiment flow
-- Urban-only experiment flow
-
-The old mixed scene switching flow (Highway/Urban alternating every 200 episodes) is removed from the main workflow.
-
-## Project Goal
-
-Train and compare:
-- DQN (MLP)
-- DRQN (LSTM)
-
-against fixed-threshold baselines under one scenario at a time.
 
 ## Main Files
 
@@ -28,86 +12,6 @@ against fixed-threshold baselines under one scenario at a time.
 - `02_train_urban.py`: Urban training for DQN + DRQN
 - `03_plot_paper_figures.py`: unified plotting script for paper/PPT-aligned figures
 
-## Episode Time Definition
-
-Each episode is fixed:
-- `EPISODE_STEPS = 500`
-- `SIM_STEP_SECONDS = 0.1`
-- Episode duration = `500 * 0.1 = 50 seconds`
-
-Episode termination is only based on step count reaching 500.
-
-## KPI Definitions (Attempt-Based)
-
-Per episode:
-- `HFR = ho_failed / max(ho_attempted, 1)`
-- `PPR = pingpong / max(ho_attempted, 1)`
-- `EHR = 1 - HFR - PPR`
-
-Notes:
-- `ho_failed` counts only handover/reselection failures after attempt.
-- `weak_signal_event` is tracked separately and does **not** count as HFR.
-
-## Output Layout
-
-- `Result/highway/baseline/...`
-- `Result/highway/train/...`
-- `Result/highway/figures/...`
-- `Result/urban/baseline/...`
-- `Result/urban/train/...`
-- `Result/urban/figures/...`
-
-## Highway Workflow
-
-1. Run Highway baseline:
-
-```bash
-python 01_baseline_highway.py
-```
-
-2. Run Highway training (default: 3 seeds `71,123,456`, 3000 episodes):
-
-```bash
-python 02_train_highway.py
-```
-
-3. Generate Highway paper figures:
-
-```bash
-python 03_plot_paper_figures.py --scenario highway
-```
-
-## Urban Workflow
-
-1. Run Urban baseline:
-
-```bash
-python 01_baseline_urban.py
-```
-
-2. Run Urban training:
-
-```bash
-python 02_train_urban.py
-```
-
-3. Generate Urban paper figures:
-
-```bash
-python 03_plot_paper_figures.py --scenario urban
-```
-
-## Deprecated Old Flow
-
-The following old mixed-scene scripts are deprecated and removed from main usage:
-- `01_discovery_and_baseline.py`
-- `02_main.py`
-- `02_seed_supplement.py`
-- `03_kpi_trends.py`
-- `04_bar_and_leap.py`
-- `05_scene_bar.py`
-- `06.py`
-- `07.py`
 
 
 
@@ -126,8 +30,8 @@ EPISODE_STEPS = 500
 SCENARIO_PROFILES = {
     "Highway": {
         "speed_mps": 120.0 / 3.6,  # 33.333... m/s
-        "inter_relay_dist_m": 1200.0,
-        "shadowing_std_db": 4.0,
+        "inter_relay_dist_m": 1400.0,
+        "shadowing_std_db": 6.0,
     },
     "Urban": {
         "speed_mps": 60.0 / 3.6,  # 16.666... m/s
@@ -150,15 +54,21 @@ NOISE_FIGURE_DB = 9.0
 BANDWIDTH_HZ = 10e6
 THERMAL_NOISE_DENSITY = -174
 NOISE_FLOOR_DBM = THERMAL_NOISE_DENSITY + 10 * np.log10(BANDWIDTH_HZ) + NOISE_FIGURE_DB
+RSRP_NOISE_STD_DB = 2.0
 
 # ============================================================
 # 3GPP reselection core logic
 # ============================================================
 HYSTERESIS_DB = 3.0
-TTT_STEPS = 3
-TARGET_RSRP_FAIL_THRESHOLD_DBM = -105.0
-PINGPONG_WINDOW_STEPS = 10  # 1 second with 0.1s step
-WEAK_SIGNAL_THRESHOLD_DBM = -115.0
+TTT_SECONDS = 0.3
+TTT_STEPS = int(round(TTT_SECONDS / SIM_STEP_SECONDS))
+TARGET_RSRP_FAIL_THRESHOLD_DBM = -80.0
+SUCCESS_MARGIN_DB = 1.0
+PINGPONG_WINDOW_STEPS = 180  # 18 seconds with 0.1s step
+WEAK_SIGNAL_THRESHOLD_DBM = -105.0
+HO_VALIDATION_STEPS = 5
+VALIDATION_MIN_SUCCESS_RATIO = 0.6
+POST_HO_POSITION_OFFSET_M = -70.0
 
 # ============================================================
 # RL action/state/training
@@ -175,8 +85,12 @@ BATCH_SIZE = 256
 EPSILON_START = 1.0
 EPSILON_END = 0.05
 EPSILON_DECAY = 0.997
+EPS_START = 1.0
+EPS_END = 0.05
+EPS_DECAY = 1500
 
 TARGET_UPDATE_INTERVAL = 10
+TRAIN_FREQ = 4
 
 # ============================================================
 # Reward weights (explicitly configurable)
@@ -200,6 +114,8 @@ REWARD_STAGNATION = 1.0
 STAGNATION_START_STEPS = 80
 STAGNATION_RSRP_THRESHOLD_DBM = -100.0
 STAGNATION_NORMALIZER = 100.0
+STAGNATION_PENALTY_BASE = 0.2
+STAGNATION_DECAY_EPISODES = 600
 
 # ============================================================
 # Experiment defaults
@@ -212,11 +128,19 @@ URBAN_EPISODES = 3000
 
 BASELINE_EVAL_EPISODES = 200
 BASELINE_SEED = 250
+BASELINE_MIN_TOTAL_ATTEMPTS = 20
+EVAL_INTERVAL_EPISODES = 100
+EVAL_EPISODES = 20
+
+
+
 
 
 
 ###vehicel_env.py
 import numpy as np
+
+import math
 
 import config
 
@@ -245,10 +169,22 @@ class VehicleEnv:
 
         self.ttt_counter = 0
         self.time_step = 0
-        self.last_ho_time = -9999
+        self.last_success_ho_time = -10**9
         self.steps_since_last_ho = 0
+        self.current_episode = 0
+        self.current_relay_id = 0
+        self.prev_relay_id_before_last_success_ho = None
 
+        self._reset_pending_state()
         self.episode_stats = {}
+
+    def _reset_pending_state(self):
+        self.pending_ho = False
+        self.pending_target_relay_id = None
+        self.pending_window_remaining = 0
+        self.pending_success_counter = 0
+        self.pending_failure_counter = 0
+        self.pending_old_relay_id = None
 
     def _validate_scenario(self, scenario):
         if scenario not in config.SCENARIO_PROFILES:
@@ -264,6 +200,9 @@ class VehicleEnv:
         self.shadowing_std = float(profile["shadowing_std_db"])
         self.ue_speed = float(profile["speed_mps"])
 
+    def set_episode(self, episode):
+        self.current_episode = int(episode)
+
     def reset(self, force_scenario=None):
         if force_scenario is not None:
             self.scenario_type = self._validate_scenario(force_scenario)
@@ -271,8 +210,11 @@ class VehicleEnv:
 
         self.ttt_counter = 0
         self.time_step = 0
-        self.last_ho_time = -9999
+        self.last_success_ho_time = -10**9
         self.steps_since_last_ho = 0
+        self.current_relay_id = 0
+        self.prev_relay_id_before_last_success_ho = None
+        self._reset_pending_state()
 
         self.episode_stats = {
             "ho_attempted": 0,
@@ -280,9 +222,12 @@ class VehicleEnv:
             "ho_failed": 0,
             "pingpong": 0,
             "weak_signal_event": 0,
+            "pending_validation_started": 0,
+            "validation_success": 0,
+            "validation_failure": 0,
         }
 
-        self.ue_relative_x = np.random.uniform(0.0, 50.0)
+        self.ue_relative_x = np.random.uniform(0.0, self.inter_relay_dist * 0.8)
         self.current_rsrp = self._calculate_physics_rsrp(self.ue_relative_x)
         self.last_rsrp = self.current_rsrp
 
@@ -300,15 +245,43 @@ class VehicleEnv:
         noise = np.random.normal(0.0, self.shadowing_std)
         return config.TX_POWER_DBM - path_loss + noise
 
+    def _distance_to_relay(self, relay_id):
+        # Minimal-change geometry: keep mirrored backbone and bind serving/target via relay id.
+        if relay_id == self.current_relay_id:
+            return self.ue_relative_x
+        return abs(self.inter_relay_dist - self.ue_relative_x)
+
+    def _compute_serving_target_rsrp(self, serving_relay_id, target_relay_id):
+        dist_serving = self._distance_to_relay(serving_relay_id)
+        dist_target = self._distance_to_relay(target_relay_id)
+        rsrp_serving = self._calculate_physics_rsrp(dist_serving)
+        rsrp_target = self._calculate_physics_rsrp(dist_target)
+        rsrp_serving += np.random.normal(0.0, config.RSRP_NOISE_STD_DB)
+        rsrp_target += np.random.normal(0.0, config.RSRP_NOISE_STD_DB)
+        return rsrp_serving, rsrp_target
+
+    def _target_condition(self, rsrp_serving, rsrp_target):
+        target_quality_ok = rsrp_target >= config.TARGET_RSRP_FAIL_THRESHOLD_DBM
+        target_has_margin = rsrp_target >= (rsrp_serving + config.SUCCESS_MARGIN_DB)
+        return bool(target_quality_ok and target_has_margin)
+
     def _episode_kpi(self):
-        attempts = max(self.episode_stats["ho_attempted"], 1)
-        hfr = self.episode_stats["ho_failed"] / attempts
-        ppr = self.episode_stats["pingpong"] / attempts
-        ehr = 1.0 - hfr - ppr
+        attempts = int(self.episode_stats["ho_attempted"])
+        if attempts == 0:
+            hfr = np.nan
+            ppr = np.nan
+            ehr = np.nan
+            no_attempt_episode = 1
+        else:
+            hfr = self.episode_stats["ho_failed"] / attempts
+            ppr = self.episode_stats["pingpong"] / attempts
+            ehr = 1.0 - hfr - ppr
+            no_attempt_episode = 0
         return {
             "hfr": float(hfr),
             "ppr": float(ppr),
             "ehr": float(ehr),
+            "no_attempt_episode": int(no_attempt_episode),
         }
 
     def get_episode_stats(self):
@@ -323,39 +296,94 @@ class VehicleEnv:
         selected_threshold = config.ACTION_THRESHOLDS[action_index]
         self.ue_relative_x += self.ue_speed * config.SIM_STEP_SECONDS
 
-        rsrp_serving = self._calculate_physics_rsrp(self.ue_relative_x)
-        dist_target = abs(self.inter_relay_dist - self.ue_relative_x)
-        rsrp_target = self._calculate_physics_rsrp(dist_target)
-
-        trigger_reselection = False
-        if rsrp_serving < selected_threshold:
-            self.ttt_counter += 1
+        serving_relay_id = self.current_relay_id
+        if self.pending_ho and self.pending_target_relay_id is not None:
+            target_relay_id = self.pending_target_relay_id
         else:
-            self.ttt_counter = 0
+            target_relay_id = 1 - serving_relay_id
 
-        if self.ttt_counter >= config.TTT_STEPS:
-            if rsrp_target > (rsrp_serving + config.HYSTERESIS_DB):
-                trigger_reselection = True
+        rsrp_serving, rsrp_target = self._compute_serving_target_rsrp(
+            serving_relay_id,
+            target_relay_id,
+        )
 
-        ho_attempted = 1 if trigger_reselection else 0
+        ho_attempted = 0
         ho_success = 0
         ho_failed = 0
         pingpong = 0
 
-        if trigger_reselection:
-            if rsrp_target < config.TARGET_RSRP_FAIL_THRESHOLD_DBM:
-                ho_failed = 1
+        if self.pending_ho:
+            if self._target_condition(rsrp_serving, rsrp_target):
+                self.pending_success_counter += 1
             else:
-                ho_success = 1
+                self.pending_failure_counter += 1
 
-                if (self.time_step - self.last_ho_time) < config.PINGPONG_WINDOW_STEPS:
-                    pingpong = 1
+            self.pending_window_remaining -= 1
 
-                self.last_ho_time = self.time_step
-                self.ue_relative_x = max(5.0, abs(self.inter_relay_dist - self.ue_relative_x))
-                rsrp_serving = self._calculate_physics_rsrp(self.ue_relative_x)
+            if self.pending_window_remaining <= 0:
+                success_ratio = self.pending_success_counter / max(1, int(config.HO_VALIDATION_STEPS))
 
-            self.ttt_counter = 0
+                if success_ratio >= float(config.VALIDATION_MIN_SUCCESS_RATIO):
+                    ho_success = 1
+
+                    old_relay_id = (
+                        self.pending_old_relay_id
+                        if self.pending_old_relay_id is not None
+                        else self.current_relay_id
+                    )
+                    new_relay_id = (
+                        self.pending_target_relay_id
+                        if self.pending_target_relay_id is not None
+                        else (1 - old_relay_id)
+                    )
+
+                    if (
+                        self.prev_relay_id_before_last_success_ho is not None
+                        and new_relay_id == self.prev_relay_id_before_last_success_ho
+                        and (self.time_step - self.last_success_ho_time) < config.PINGPONG_WINDOW_STEPS
+                    ):
+                        pingpong = 1
+
+                    self.prev_relay_id_before_last_success_ho = old_relay_id
+                    self.current_relay_id = new_relay_id
+                    self.last_success_ho_time = self.time_step
+
+                    mirrored_x = abs(self.inter_relay_dist - self.ue_relative_x)
+                    # Coordinate-equivalent handling:
+                    # in this local-distance representation, larger x means less stable serving.
+                    # therefore a negative config.POST_HO_POSITION_OFFSET_M should push x upward.
+                    unstable_shift = -config.POST_HO_POSITION_OFFSET_M
+                    self.ue_relative_x = max(
+                        5.0,
+                        mirrored_x + unstable_shift,
+                    )
+
+                    rsrp_serving, rsrp_target = self._compute_serving_target_rsrp(
+                        self.current_relay_id,
+                        1 - self.current_relay_id,
+                    )
+                    self.episode_stats["validation_success"] += 1
+                else:
+                    ho_failed = 1
+                    self.episode_stats["validation_failure"] += 1
+
+                self._reset_pending_state()
+        else:
+            if rsrp_serving < selected_threshold:
+                self.ttt_counter += 1
+            else:
+                self.ttt_counter = 0
+
+            if self.ttt_counter >= config.TTT_STEPS:
+                ho_attempted = 1
+                self.pending_ho = True
+                self.pending_target_relay_id = 1 - self.current_relay_id
+                self.pending_window_remaining = int(config.HO_VALIDATION_STEPS)
+                self.pending_success_counter = 0
+                self.pending_failure_counter = 0
+                self.pending_old_relay_id = self.current_relay_id
+                self.episode_stats["pending_validation_started"] += 1
+                self.ttt_counter = 0
 
         if ho_success:
             self.steps_since_last_ho = 0
@@ -391,15 +419,19 @@ class VehicleEnv:
         reward -= config.REWARD_WEAK_SIGNAL * weak_signal_event
         reward += config.REWARD_ALIVE
 
-        if (
-            rsrp_serving < config.STAGNATION_RSRP_THRESHOLD_DBM
-            and self.steps_since_last_ho > config.STAGNATION_START_STEPS
-        ):
-            stagnation_term = (self.steps_since_last_ho - config.STAGNATION_START_STEPS) / max(
-                1.0,
-                config.STAGNATION_NORMALIZER,
+        stagnation_penalty = 0.0
+        stagnation_threshold_steps = getattr(
+            config,
+            "STAGNATION_THRESHOLD_STEPS",
+            config.STAGNATION_START_STEPS,
+        )
+        if self.steps_since_last_ho > stagnation_threshold_steps:
+            decay_factor = math.exp(
+                -self.current_episode / config.STAGNATION_DECAY_EPISODES
             )
-            reward -= config.REWARD_STAGNATION * min(stagnation_term, 1.0)
+            stagnation_penalty = config.STAGNATION_PENALTY_BASE * decay_factor
+
+        reward -= stagnation_penalty
 
         self.current_rsrp = rsrp_serving
         self.time_step += 1
@@ -412,16 +444,25 @@ class VehicleEnv:
             "threshold_dbm": selected_threshold,
             "rsrp": float(rsrp_serving),
             "target_rsrp": float(rsrp_target),
+            "serving_relay_id": int(serving_relay_id),
+            "target_relay_id": int(target_relay_id),
             "ho_attempted": ho_attempted,
             "ho_success": ho_success,
             "ho_failed": ho_failed,
             "pingpong": pingpong,
             "weak_signal_event": weak_signal_event,
+            "pending_ho": int(self.pending_ho),
+            "pending_window_remaining": int(self.pending_window_remaining),
+            "pending_success_counter": int(self.pending_success_counter),
+            "pending_failure_counter": int(self.pending_failure_counter),
             "episode_ho_attempted": self.episode_stats["ho_attempted"],
             "episode_ho_success": self.episode_stats["ho_success"],
             "episode_ho_failed": self.episode_stats["ho_failed"],
             "episode_pingpong": self.episode_stats["pingpong"],
             "episode_weak_signal_event": self.episode_stats["weak_signal_event"],
+            "episode_pending_validation_started": self.episode_stats["pending_validation_started"],
+            "episode_validation_success": self.episode_stats["validation_success"],
+            "episode_validation_failure": self.episode_stats["validation_failure"],
         }
         info.update(self._episode_kpi())
 
@@ -449,6 +490,8 @@ class VehicleEnv:
         )
 
 
+
+
 ###01_baseline_highway.py
 import argparse
 import json
@@ -463,6 +506,34 @@ from vehicle_env import VehicleEnv
 
 
 SCENARIO = "Highway"
+
+
+def safe_nanmean(values):
+    s = pd.Series(values, dtype=float)
+    if s.notna().any():
+        return float(s.mean(skipna=True))
+    return float("nan")
+
+
+def estimate_serving_rsrp_range(episodes, seed, action_index=3):
+    np.random.seed(seed)
+    random.seed(seed)
+
+    env = VehicleEnv(scenario=SCENARIO)
+    vals = []
+    for _ in range(episodes):
+        env.reset()
+        done = False
+        while not done:
+            _, _, done, info = env.step(action_index)
+            vals.append(float(info["rsrp"]))
+
+    arr = np.asarray(vals, dtype=float)
+    return {
+        "rsrp_min": float(np.min(arr)),
+        "rsrp_max": float(np.max(arr)),
+        "rsrp_mean": float(np.mean(arr)),
+    }
 
 
 def evaluate_threshold(action_index, episodes, seed):
@@ -481,6 +552,10 @@ def evaluate_threshold(action_index, episodes, seed):
     total_failed = 0
     total_pingpong = 0
     total_weak_signal = 0
+    no_attempt_episode_count = 0
+    total_pending_validation_started = 0
+    total_validation_success = 0
+    total_validation_failure = 0
 
     for _ in range(episodes):
         env.reset()
@@ -502,6 +577,10 @@ def evaluate_threshold(action_index, episodes, seed):
         total_failed += int(stats["ho_failed"])
         total_pingpong += int(stats["pingpong"])
         total_weak_signal += int(stats["weak_signal_event"])
+        no_attempt_episode_count += int(stats["no_attempt_episode"])
+        total_pending_validation_started += int(stats["pending_validation_started"])
+        total_validation_success += int(stats["validation_success"])
+        total_validation_failure += int(stats["validation_failure"])
 
     agg_hfr = total_failed / max(total_attempted, 1)
     agg_ppr = total_pingpong / max(total_attempted, 1)
@@ -512,9 +591,9 @@ def evaluate_threshold(action_index, episodes, seed):
         "threshold_dbm": config.ACTION_THRESHOLDS[action_index],
         "episodes": int(episodes),
         "mean_reward": float(np.mean(rewards)),
-        "mean_episode_hfr": float(np.mean(ep_hfr)),
-        "mean_episode_ppr": float(np.mean(ep_ppr)),
-        "mean_episode_ehr": float(np.mean(ep_ehr)),
+        "mean_episode_hfr": safe_nanmean(ep_hfr),
+        "mean_episode_ppr": safe_nanmean(ep_ppr),
+        "mean_episode_ehr": safe_nanmean(ep_ehr),
         "aggregate_hfr": float(agg_hfr),
         "aggregate_ppr": float(agg_ppr),
         "aggregate_ehr": float(agg_ehr),
@@ -523,7 +602,37 @@ def evaluate_threshold(action_index, episodes, seed):
         "total_ho_failed": int(total_failed),
         "total_pingpong": int(total_pingpong),
         "total_weak_signal_event": int(total_weak_signal),
+        "no_attempt_episode_count": int(no_attempt_episode_count),
+        "no_attempt_episode_ratio": float(no_attempt_episode_count / max(episodes, 1)),
+        "total_pending_validation_started": int(total_pending_validation_started),
+        "total_validation_success": int(total_validation_success),
+        "total_validation_failure": int(total_validation_failure),
     }
+
+
+def select_best_baseline(metrics_df):
+    valid_df = metrics_df[
+        metrics_df["total_ho_attempted"] >= int(config.BASELINE_MIN_TOTAL_ATTEMPTS)
+    ].copy()
+
+    if valid_df.empty:
+        ranked = metrics_df.sort_values(
+            by=["mean_reward"],
+            ascending=[False],
+        )
+        best_row = ranked.iloc[0].to_dict()
+        selection_mode = "fallback_reward"
+    else:
+        ranked = valid_df.sort_values(
+            by=["aggregate_ehr", "aggregate_hfr", "aggregate_ppr", "mean_reward"],
+            ascending=[False, True, True, False],
+        )
+        best_row = ranked.iloc[0].to_dict()
+        selection_mode = "filtered_kpi_priority"
+
+    best_row["selection_mode"] = selection_mode
+    best_row["baseline_min_total_attempts"] = int(config.BASELINE_MIN_TOTAL_ATTEMPTS)
+    return best_row
 
 
 def parse_args():
@@ -539,6 +648,16 @@ def main():
     out_dir = os.path.join("Result", "highway", "baseline")
     os.makedirs(out_dir, exist_ok=True)
 
+    rsrp_stats = estimate_serving_rsrp_range(
+        episodes=max(10, args.episodes // 5),
+        seed=args.seed,
+    )
+    print(
+        f"[Baseline][{SCENARIO}] serving RSRP range "
+        f"min={rsrp_stats['rsrp_min']:.2f}, max={rsrp_stats['rsrp_max']:.2f}, "
+        f"mean={rsrp_stats['rsrp_mean']:.2f}, weak_threshold={config.WEAK_SIGNAL_THRESHOLD_DBM:.1f}"
+    )
+
     rows = []
     for action_index, threshold in enumerate(config.ACTION_THRESHOLDS):
         row = evaluate_threshold(
@@ -550,19 +669,22 @@ def main():
         print(
             f"[Baseline][{SCENARIO}] threshold={threshold} "
             f"reward={row['mean_reward']:.3f} "
-            f"HFR={row['aggregate_hfr']:.4f} "
-            f"PPR={row['aggregate_ppr']:.4f} "
-            f"EHR={row['aggregate_ehr']:.4f}"
+            f"agg_HFR={row['aggregate_hfr']:.4f} "
+            f"agg_PPR={row['aggregate_ppr']:.4f} "
+            f"agg_EHR={row['aggregate_ehr']:.4f} "
+            f"attempts={row['total_ho_attempted']} "
+            f"weak={row['total_weak_signal_event']} "
+            f"val_start={row['total_pending_validation_started']} "
+            f"val_succ={row['total_validation_success']} "
+            f"val_fail={row['total_validation_failure']} "
+            f"no_attempt_ratio={row['no_attempt_episode_ratio']:.3f}"
         )
 
     metrics_df = pd.DataFrame(rows).sort_values("threshold_dbm").reset_index(drop=True)
     metrics_path = os.path.join(out_dir, "threshold_metrics.csv")
     metrics_df.to_csv(metrics_path, index=False)
 
-    best_idx = int(metrics_df["mean_reward"].idxmax())
-    best_row = metrics_df.iloc[best_idx].to_dict()
-    best_row["best_rule"] = "max_mean_reward"
-
+    best_row = select_best_baseline(metrics_df)
     best_path = os.path.join(out_dir, "best_baseline.json")
     with open(best_path, "w", encoding="utf-8") as f:
         json.dump(best_row, f, indent=2)
@@ -571,15 +693,22 @@ def main():
     print(f"Saved: {best_path}")
     print(
         f"Best threshold={best_row['threshold_dbm']} dBm, "
+        f"selection_mode={best_row['selection_mode']}, "
         f"reward={best_row['mean_reward']:.3f}, "
-        f"HFR={best_row['aggregate_hfr']:.4f}, "
-        f"PPR={best_row['aggregate_ppr']:.4f}, "
-        f"EHR={best_row['aggregate_ehr']:.4f}"
+        f"agg_HFR={best_row['aggregate_hfr']:.4f}, "
+        f"agg_PPR={best_row['aggregate_ppr']:.4f}, "
+        f"agg_EHR={best_row['aggregate_ehr']:.4f}, "
+        f"attempts={best_row['total_ho_attempted']}, "
+        f"val_start={best_row['total_pending_validation_started']}, "
+        f"val_succ={best_row['total_validation_success']}, "
+        f"val_fail={best_row['total_validation_failure']}, "
+        f"no_attempt_ratio={best_row['no_attempt_episode_ratio']:.3f}"
     )
 
 
 if __name__ == "__main__":
     main()
+
 
 
 ##01_baseline_uraban.py
@@ -598,6 +727,34 @@ from vehicle_env import VehicleEnv
 SCENARIO = "Urban"
 
 
+def safe_nanmean(values):
+    s = pd.Series(values, dtype=float)
+    if s.notna().any():
+        return float(s.mean(skipna=True))
+    return float("nan")
+
+
+def estimate_serving_rsrp_range(episodes, seed, action_index=3):
+    np.random.seed(seed)
+    random.seed(seed)
+
+    env = VehicleEnv(scenario=SCENARIO)
+    vals = []
+    for _ in range(episodes):
+        env.reset()
+        done = False
+        while not done:
+            _, _, done, info = env.step(action_index)
+            vals.append(float(info["rsrp"]))
+
+    arr = np.asarray(vals, dtype=float)
+    return {
+        "rsrp_min": float(np.min(arr)),
+        "rsrp_max": float(np.max(arr)),
+        "rsrp_mean": float(np.mean(arr)),
+    }
+
+
 def evaluate_threshold(action_index, episodes, seed):
     np.random.seed(seed)
     random.seed(seed)
@@ -614,6 +771,10 @@ def evaluate_threshold(action_index, episodes, seed):
     total_failed = 0
     total_pingpong = 0
     total_weak_signal = 0
+    no_attempt_episode_count = 0
+    total_pending_validation_started = 0
+    total_validation_success = 0
+    total_validation_failure = 0
 
     for _ in range(episodes):
         env.reset()
@@ -635,6 +796,10 @@ def evaluate_threshold(action_index, episodes, seed):
         total_failed += int(stats["ho_failed"])
         total_pingpong += int(stats["pingpong"])
         total_weak_signal += int(stats["weak_signal_event"])
+        no_attempt_episode_count += int(stats["no_attempt_episode"])
+        total_pending_validation_started += int(stats["pending_validation_started"])
+        total_validation_success += int(stats["validation_success"])
+        total_validation_failure += int(stats["validation_failure"])
 
     agg_hfr = total_failed / max(total_attempted, 1)
     agg_ppr = total_pingpong / max(total_attempted, 1)
@@ -645,9 +810,9 @@ def evaluate_threshold(action_index, episodes, seed):
         "threshold_dbm": config.ACTION_THRESHOLDS[action_index],
         "episodes": int(episodes),
         "mean_reward": float(np.mean(rewards)),
-        "mean_episode_hfr": float(np.mean(ep_hfr)),
-        "mean_episode_ppr": float(np.mean(ep_ppr)),
-        "mean_episode_ehr": float(np.mean(ep_ehr)),
+        "mean_episode_hfr": safe_nanmean(ep_hfr),
+        "mean_episode_ppr": safe_nanmean(ep_ppr),
+        "mean_episode_ehr": safe_nanmean(ep_ehr),
         "aggregate_hfr": float(agg_hfr),
         "aggregate_ppr": float(agg_ppr),
         "aggregate_ehr": float(agg_ehr),
@@ -656,7 +821,37 @@ def evaluate_threshold(action_index, episodes, seed):
         "total_ho_failed": int(total_failed),
         "total_pingpong": int(total_pingpong),
         "total_weak_signal_event": int(total_weak_signal),
+        "no_attempt_episode_count": int(no_attempt_episode_count),
+        "no_attempt_episode_ratio": float(no_attempt_episode_count / max(episodes, 1)),
+        "total_pending_validation_started": int(total_pending_validation_started),
+        "total_validation_success": int(total_validation_success),
+        "total_validation_failure": int(total_validation_failure),
     }
+
+
+def select_best_baseline(metrics_df):
+    valid_df = metrics_df[
+        metrics_df["total_ho_attempted"] >= int(config.BASELINE_MIN_TOTAL_ATTEMPTS)
+    ].copy()
+
+    if valid_df.empty:
+        ranked = metrics_df.sort_values(
+            by=["mean_reward"],
+            ascending=[False],
+        )
+        best_row = ranked.iloc[0].to_dict()
+        selection_mode = "fallback_reward"
+    else:
+        ranked = valid_df.sort_values(
+            by=["aggregate_ehr", "aggregate_hfr", "aggregate_ppr", "mean_reward"],
+            ascending=[False, True, True, False],
+        )
+        best_row = ranked.iloc[0].to_dict()
+        selection_mode = "filtered_kpi_priority"
+
+    best_row["selection_mode"] = selection_mode
+    best_row["baseline_min_total_attempts"] = int(config.BASELINE_MIN_TOTAL_ATTEMPTS)
+    return best_row
 
 
 def parse_args():
@@ -672,6 +867,16 @@ def main():
     out_dir = os.path.join("Result", "urban", "baseline")
     os.makedirs(out_dir, exist_ok=True)
 
+    rsrp_stats = estimate_serving_rsrp_range(
+        episodes=max(10, args.episodes // 5),
+        seed=args.seed,
+    )
+    print(
+        f"[Baseline][{SCENARIO}] serving RSRP range "
+        f"min={rsrp_stats['rsrp_min']:.2f}, max={rsrp_stats['rsrp_max']:.2f}, "
+        f"mean={rsrp_stats['rsrp_mean']:.2f}, weak_threshold={config.WEAK_SIGNAL_THRESHOLD_DBM:.1f}"
+    )
+
     rows = []
     for action_index, threshold in enumerate(config.ACTION_THRESHOLDS):
         row = evaluate_threshold(
@@ -683,19 +888,22 @@ def main():
         print(
             f"[Baseline][{SCENARIO}] threshold={threshold} "
             f"reward={row['mean_reward']:.3f} "
-            f"HFR={row['aggregate_hfr']:.4f} "
-            f"PPR={row['aggregate_ppr']:.4f} "
-            f"EHR={row['aggregate_ehr']:.4f}"
+            f"agg_HFR={row['aggregate_hfr']:.4f} "
+            f"agg_PPR={row['aggregate_ppr']:.4f} "
+            f"agg_EHR={row['aggregate_ehr']:.4f} "
+            f"attempts={row['total_ho_attempted']} "
+            f"weak={row['total_weak_signal_event']} "
+            f"val_start={row['total_pending_validation_started']} "
+            f"val_succ={row['total_validation_success']} "
+            f"val_fail={row['total_validation_failure']} "
+            f"no_attempt_ratio={row['no_attempt_episode_ratio']:.3f}"
         )
 
     metrics_df = pd.DataFrame(rows).sort_values("threshold_dbm").reset_index(drop=True)
     metrics_path = os.path.join(out_dir, "threshold_metrics.csv")
     metrics_df.to_csv(metrics_path, index=False)
 
-    best_idx = int(metrics_df["mean_reward"].idxmax())
-    best_row = metrics_df.iloc[best_idx].to_dict()
-    best_row["best_rule"] = "max_mean_reward"
-
+    best_row = select_best_baseline(metrics_df)
     best_path = os.path.join(out_dir, "best_baseline.json")
     with open(best_path, "w", encoding="utf-8") as f:
         json.dump(best_row, f, indent=2)
@@ -704,22 +912,29 @@ def main():
     print(f"Saved: {best_path}")
     print(
         f"Best threshold={best_row['threshold_dbm']} dBm, "
+        f"selection_mode={best_row['selection_mode']}, "
         f"reward={best_row['mean_reward']:.3f}, "
-        f"HFR={best_row['aggregate_hfr']:.4f}, "
-        f"PPR={best_row['aggregate_ppr']:.4f}, "
-        f"EHR={best_row['aggregate_ehr']:.4f}"
+        f"agg_HFR={best_row['aggregate_hfr']:.4f}, "
+        f"agg_PPR={best_row['aggregate_ppr']:.4f}, "
+        f"agg_EHR={best_row['aggregate_ehr']:.4f}, "
+        f"attempts={best_row['total_ho_attempted']}, "
+        f"val_start={best_row['total_pending_validation_started']}, "
+        f"val_succ={best_row['total_validation_success']}, "
+        f"val_fail={best_row['total_validation_failure']}, "
+        f"no_attempt_ratio={best_row['no_attempt_episode_ratio']:.3f}"
     )
 
 
 if __name__ == "__main__":
     main()
 
-
-##02_train_highway.py
+##02_main.py
 import argparse
+import gc
 import json
 import os
 import random
+import sys
 
 import numpy as np
 import pandas as pd
@@ -731,11 +946,433 @@ from lstm_dqn_agent import LSTMDQNAgent
 from vehicle_env import VehicleEnv
 
 
-SCENARIO = "Highway"
 MODEL_SPECS = [
     ("DQN (MLP)", "DQN_MLP", DQNAgent),
-    ("DRQN (LSTM)", "DRQN_LSTM", LSTMDQNAgent),
+    ("LSTM-DQN", "LSTM_DQN", LSTMDQNAgent),
 ]
+
+
+def set_global_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def run_train_episode(env, agent, ep=None):
+    if hasattr(agent, "state_sequence"):
+        agent.state_sequence.clear()
+
+    state = env.reset()
+    done = False
+    total_reward = 0.0
+
+    step = 0
+    while not done:
+        if step == 0 and ep is not None and ep % 200 == 0:
+            print(f"[Debug] Training frequency = every {config.TRAIN_FREQ} steps")
+
+        action = agent.select_action(state, is_training=True)
+        next_state, reward, done, _ = env.step(action)
+
+        agent.store_transition(state, action, reward, next_state, done)
+        if step % config.TRAIN_FREQ == 0:
+            agent.train_step()
+
+        state = next_state
+        total_reward += float(reward)
+        step += 1
+
+    stats = env.get_episode_stats()
+    return {
+        "reward": float(total_reward),
+        "ho_attempted": int(stats["ho_attempted"]),
+        "ho_success": int(stats["ho_success"]),
+        "ho_failed": int(stats["ho_failed"]),
+        "pingpong": int(stats["pingpong"]),
+        "weak_signal_event": int(stats["weak_signal_event"]),
+        "no_attempt_episode": int(stats["no_attempt_episode"]),
+        "pending_validation_started": int(stats["pending_validation_started"]),
+        "validation_success": int(stats["validation_success"]),
+        "validation_failure": int(stats["validation_failure"]),
+        "hfr": float(stats["hfr"]),
+        "ppr": float(stats["ppr"]),
+        "ehr": float(stats["ehr"]),
+    }
+
+
+def run_eval_episode(env, agent, checkpoint_ep):
+    if hasattr(agent, "state_sequence"):
+        agent.state_sequence.clear()
+
+    env.set_episode(checkpoint_ep)
+    state = env.reset()
+    done = False
+    total_reward = 0.0
+
+    while not done:
+        action = agent.select_action(state, is_training=False)
+        next_state, reward, done, _ = env.step(action)
+        state = next_state
+        total_reward += float(reward)
+
+    stats = env.get_episode_stats()
+    return {
+        "reward": float(total_reward),
+        "ho_attempted": int(stats["ho_attempted"]),
+        "ho_success": int(stats["ho_success"]),
+        "ho_failed": int(stats["ho_failed"]),
+        "pingpong": int(stats["pingpong"]),
+        "weak_signal_event": int(stats["weak_signal_event"]),
+        "no_attempt_episode": int(stats["no_attempt_episode"]),
+        "hfr": float(stats["hfr"]),
+        "ppr": float(stats["ppr"]),
+        "ehr": float(stats["ehr"]),
+    }
+
+
+def evaluate_checkpoint(env, agent, checkpoint_ep, eval_episodes):
+    rows = [run_eval_episode(env, agent, checkpoint_ep) for _ in range(int(eval_episodes))]
+    df = pd.DataFrame(rows)
+
+    total_attempted = int(df["ho_attempted"].sum())
+    total_failed = int(df["ho_failed"].sum())
+    total_pingpong = int(df["pingpong"].sum())
+
+    aggregate_hfr = total_failed / max(total_attempted, 1)
+    aggregate_ppr = total_pingpong / max(total_attempted, 1)
+    aggregate_ehr = 1.0 - aggregate_hfr - aggregate_ppr
+
+    return {
+        "checkpoint_episode": int(checkpoint_ep),
+        "eval_episodes": int(eval_episodes),
+        "reward": float(df["reward"].mean()),
+        "hfr": float(df["hfr"].mean()),
+        "ppr": float(df["ppr"].mean()),
+        "ehr": float(df["ehr"].mean()),
+        "aggregate_hfr": float(aggregate_hfr),
+        "aggregate_ppr": float(aggregate_ppr),
+        "aggregate_ehr": float(aggregate_ehr),
+        "total_ho_attempted": int(total_attempted),
+        "total_ho_success": int(df["ho_success"].sum()),
+        "total_ho_failed": int(total_failed),
+        "total_pingpong": int(total_pingpong),
+        "total_weak_signal_event": int(df["weak_signal_event"].sum()),
+        "no_attempt_episode_count": int(df["no_attempt_episode"].sum()),
+        "no_attempt_episode_ratio": float(df["no_attempt_episode"].mean()),
+    }
+
+
+def summarize_seed(df, scenario, model_name, model_tag, seed):
+    total_attempted = int(df["ho_attempted"].sum())
+    total_success = int(df["ho_success"].sum())
+    total_failed = int(df["ho_failed"].sum())
+    total_pingpong = int(df["pingpong"].sum())
+    total_weak_signal = int(df["weak_signal_event"].sum())
+    no_attempt_episode_count = int(df["no_attempt_episode"].sum())
+    total_pending_validation_started = int(df["pending_validation_started"].sum())
+    total_validation_success = int(df["validation_success"].sum())
+    total_validation_failure = int(df["validation_failure"].sum())
+
+    aggregate_hfr = total_failed / max(total_attempted, 1)
+    aggregate_ppr = total_pingpong / max(total_attempted, 1)
+    aggregate_ehr = 1.0 - aggregate_hfr - aggregate_ppr
+
+    tail_n = min(100, len(df))
+    tail_df = df.tail(tail_n)
+
+    return {
+        "scenario": scenario,
+        "model": model_name,
+        "model_tag": model_tag,
+        "seed": int(seed),
+        "episodes": int(len(df)),
+        "mean_reward": float(df["reward"].mean()),
+        "mean_hfr": float(df["hfr"].mean()),
+        "mean_ppr": float(df["ppr"].mean()),
+        "mean_ehr": float(df["ehr"].mean()),
+        "tail100_reward": float(tail_df["reward"].mean()),
+        "tail100_hfr": float(tail_df["hfr"].mean()),
+        "tail100_ppr": float(tail_df["ppr"].mean()),
+        "tail100_ehr": float(tail_df["ehr"].mean()),
+        "aggregate_hfr": float(aggregate_hfr),
+        "aggregate_ppr": float(aggregate_ppr),
+        "aggregate_ehr": float(aggregate_ehr),
+        "total_ho_attempted": total_attempted,
+        "total_ho_success": total_success,
+        "total_ho_failed": total_failed,
+        "total_pingpong": total_pingpong,
+        "total_weak_signal_event": total_weak_signal,
+        "no_attempt_episode_count": no_attempt_episode_count,
+        "no_attempt_episode_ratio": float(no_attempt_episode_count / max(len(df), 1)),
+        "total_pending_validation_started": total_pending_validation_started,
+        "total_validation_success": total_validation_success,
+        "total_validation_failure": total_validation_failure,
+    }
+
+
+def summarize_model(seed_summary_df, scenario, model_name, model_tag):
+    total_attempted = int(seed_summary_df["total_ho_attempted"].sum())
+    total_success = int(seed_summary_df["total_ho_success"].sum())
+    total_failed = int(seed_summary_df["total_ho_failed"].sum())
+    total_pingpong = int(seed_summary_df["total_pingpong"].sum())
+    total_weak_signal = int(seed_summary_df["total_weak_signal_event"].sum())
+    no_attempt_episode_count = int(seed_summary_df["no_attempt_episode_count"].sum())
+    total_episodes = int(seed_summary_df["episodes"].sum())
+    total_pending_validation_started = int(seed_summary_df["total_pending_validation_started"].sum())
+    total_validation_success = int(seed_summary_df["total_validation_success"].sum())
+    total_validation_failure = int(seed_summary_df["total_validation_failure"].sum())
+
+    aggregate_hfr = total_failed / max(total_attempted, 1)
+    aggregate_ppr = total_pingpong / max(total_attempted, 1)
+    aggregate_ehr = 1.0 - aggregate_hfr - aggregate_ppr
+
+    return {
+        "scenario": scenario,
+        "model": model_name,
+        "model_tag": model_tag,
+        "n_seeds": int(len(seed_summary_df)),
+        "episodes_per_seed": int(seed_summary_df["episodes"].iloc[0]),
+        "mean_reward": float(seed_summary_df["mean_reward"].mean()),
+        "mean_hfr": float(seed_summary_df["mean_hfr"].mean()),
+        "mean_ppr": float(seed_summary_df["mean_ppr"].mean()),
+        "mean_ehr": float(seed_summary_df["mean_ehr"].mean()),
+        "tail100_reward": float(seed_summary_df["tail100_reward"].mean()),
+        "tail100_hfr": float(seed_summary_df["tail100_hfr"].mean()),
+        "tail100_ppr": float(seed_summary_df["tail100_ppr"].mean()),
+        "tail100_ehr": float(seed_summary_df["tail100_ehr"].mean()),
+        "aggregate_hfr": float(aggregate_hfr),
+        "aggregate_ppr": float(aggregate_ppr),
+        "aggregate_ehr": float(aggregate_ehr),
+        "total_ho_attempted": total_attempted,
+        "total_ho_success": total_success,
+        "total_ho_failed": total_failed,
+        "total_pingpong": total_pingpong,
+        "total_weak_signal_event": total_weak_signal,
+        "no_attempt_episode_count": no_attempt_episode_count,
+        "no_attempt_episode_ratio": float(no_attempt_episode_count / max(total_episodes, 1)),
+        "total_pending_validation_started": total_pending_validation_started,
+        "total_validation_success": total_validation_success,
+        "total_validation_failure": total_validation_failure,
+    }
+
+
+def run_training(scenario, seeds, episodes, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    model_dir = os.path.join(output_dir, "models")
+    os.makedirs(model_dir, exist_ok=True)
+    torch.set_num_threads(4)
+
+    run_meta = {
+        "scenario": scenario,
+        "episodes": int(episodes),
+        "seeds": [int(s) for s in seeds],
+        "episode_steps": int(config.EPISODE_STEPS),
+        "sim_step_seconds": float(config.SIM_STEP_SECONDS),
+    }
+    with open(os.path.join(output_dir, "run_config.json"), "w", encoding="utf-8") as f:
+        json.dump(run_meta, f, indent=2)
+
+    all_seed_rows = []
+    all_model_rows = []
+    all_eval_rows = []
+
+    for model_name, model_tag, agent_cls in MODEL_SPECS:
+        print(f"[Train][{scenario}] model={model_name}")
+        model_seed_rows = []
+
+        for seed in seeds:
+            set_global_seed(int(seed))
+
+            env = VehicleEnv(scenario=scenario)
+            agent = agent_cls()
+
+            episode_rows = []
+            eval_rows = []
+            for ep in range(1, int(episodes) + 1):
+                env.set_episode(ep)
+                row = run_train_episode(env, agent, ep=ep)
+                row["episode"] = ep
+                episode_rows.append(row)
+
+                if ep % config.TARGET_UPDATE_INTERVAL == 0:
+                    agent.update_target_network()
+
+                if ep % 200 == 0 or ep == 1 or ep == int(episodes):
+                    print(
+                        f"  seed={seed} ep={ep}/{episodes} "
+                        f"reward={row['reward']:.3f} hfr={row['hfr']:.4f} "
+                        f"ppr={row['ppr']:.4f} ehr={row['ehr']:.4f}"
+                    )
+
+                if ep % config.EVAL_INTERVAL_EPISODES == 0 or ep == int(episodes):
+                    eval_row = evaluate_checkpoint(
+                        env=env,
+                        agent=agent,
+                        checkpoint_ep=ep,
+                        eval_episodes=config.EVAL_EPISODES,
+                    )
+                    eval_row.update(
+                        {
+                            "scenario": scenario,
+                            "model": model_name,
+                            "model_tag": model_tag,
+                            "seed": int(seed),
+                        }
+                    )
+                    eval_rows.append(eval_row)
+                    all_eval_rows.append(eval_row)
+                    print(
+                        f"    eval@ep={ep} reward={eval_row['reward']:.3f} "
+                        f"hfr={eval_row['hfr']:.4f} ppr={eval_row['ppr']:.4f} "
+                        f"ehr={eval_row['ehr']:.4f}"
+                    )
+
+            ep_df = pd.DataFrame(episode_rows).sort_values("episode").reset_index(drop=True)
+            ep_path = os.path.join(output_dir, f"{model_tag}_seed{seed}.csv")
+            ep_df.to_csv(ep_path, index=False)
+
+            # Seed-level robust checkpoint save.
+            seed_file = os.path.join(output_dir, f"seed_{seed}_episodes.csv")
+            df_seed = ep_df.copy()
+            df_seed.insert(0, "model", model_name)
+            file_exists = os.path.exists(seed_file)
+            df_seed.to_csv(
+                seed_file,
+                mode="a" if file_exists else "w",
+                header=not file_exists,
+                index=False,
+            )
+            print(f"[Train] Seed {seed} results saved to {seed_file}")
+
+            if eval_rows:
+                eval_df_seed = pd.DataFrame(eval_rows).sort_values("checkpoint_episode").reset_index(drop=True)
+                eval_seed_file = os.path.join(output_dir, f"seed_{seed}_eval_trend.csv")
+                file_exists_eval = os.path.exists(eval_seed_file)
+                eval_df_seed.to_csv(
+                    eval_seed_file,
+                    mode="a" if file_exists_eval else "w",
+                    header=not file_exists_eval,
+                    index=False,
+                )
+                print(f"[Eval] Seed {seed} trend saved to {eval_seed_file}")
+
+            sys.stdout.flush()
+            if hasattr(os, "sync"):
+                try:
+                    os.sync()
+                except OSError:
+                    pass
+
+            model_path = os.path.join(model_dir, f"{model_tag}_seed{seed}.pt")
+            agent.save_model(model_path)
+
+            seed_row = summarize_seed(ep_df, scenario, model_name, model_tag, seed)
+            model_seed_rows.append(seed_row)
+            all_seed_rows.append(seed_row)
+
+            print(
+                f"  saved seed={seed} -> {ep_path}, "
+                f"aggregate_hfr={seed_row['aggregate_hfr']:.4f}, "
+                f"aggregate_ppr={seed_row['aggregate_ppr']:.4f}, "
+                f"aggregate_ehr={seed_row['aggregate_ehr']:.4f}"
+            )
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            episode_rows = None
+            print(f"[Train] Seed {seed} cleanup complete. Starting next seed...")
+
+        model_seed_df = pd.DataFrame(model_seed_rows)
+        model_summary_row = summarize_model(model_seed_df, scenario, model_name, model_tag)
+        all_model_rows.append(model_summary_row)
+
+    seed_summary_df = pd.DataFrame(all_seed_rows)
+    seed_summary_df.to_csv(os.path.join(output_dir, "seed_summary.csv"), index=False)
+
+    model_summary_df = pd.DataFrame(all_model_rows)
+    model_summary_df.to_csv(os.path.join(output_dir, "model_summary.csv"), index=False)
+
+    if all_eval_rows:
+        eval_df = pd.DataFrame(all_eval_rows)
+        model_eval_trend_df = (
+            eval_df.groupby(
+                ["scenario", "model", "model_tag", "checkpoint_episode"],
+                as_index=False,
+            )
+            .agg(
+                reward=("reward", "mean"),
+                hfr=("hfr", "mean"),
+                ppr=("ppr", "mean"),
+                ehr=("ehr", "mean"),
+                aggregate_hfr=("aggregate_hfr", "mean"),
+                aggregate_ppr=("aggregate_ppr", "mean"),
+                aggregate_ehr=("aggregate_ehr", "mean"),
+                no_attempt_episode_ratio=("no_attempt_episode_ratio", "mean"),
+                eval_episodes=("eval_episodes", "sum"),
+            )
+            .sort_values(["model", "checkpoint_episode"])
+            .reset_index(drop=True)
+        )
+        model_eval_trend_path = os.path.join(output_dir, "model_eval_trend.csv")
+        model_eval_trend_df.to_csv(model_eval_trend_path, index=False)
+        print(f"Saved: {model_eval_trend_path}")
+
+    print(f"Saved: {os.path.join(output_dir, 'seed_summary.csv')}")
+    print(f"Saved: {os.path.join(output_dir, 'model_summary.csv')}")
+
+
+def _parse_seeds(seed_str):
+    return [int(x.strip()) for x in seed_str.split(",") if x.strip()]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scenario", type=str, required=True, choices=["Highway", "Urban"])
+    parser.add_argument("--episodes", type=int, required=True)
+    parser.add_argument("--seeds", type=str, required=True, help="Comma-separated, e.g., 71,123,456")
+    parser.add_argument("--output-dir", type=str, required=True)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    seeds = _parse_seeds(args.seeds)
+    run_training(
+        scenario=args.scenario,
+        seeds=seeds,
+        episodes=args.episodes,
+        output_dir=args.output_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+##02_train_highway.py
+import argparse
+import importlib.util
+import os
+
+import config
+
+
+def load_train_core():
+    path = os.path.join(os.path.dirname(__file__), "02_main.py")
+    spec = importlib.util.spec_from_file_location("train_core_02_main", path)
+    module = importlib.util.module_from_spec(spec)
+    if spec.loader is None:
+        raise RuntimeError("Failed to load 02_main.py")
+    spec.loader.exec_module(module)
+    return module
 
 
 def parse_args():
@@ -745,229 +1382,44 @@ def parse_args():
     return parser.parse_args()
 
 
-def set_global_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
 def parse_seeds(seed_str):
     return [int(x.strip()) for x in seed_str.split(",") if x.strip()]
-
-
-def run_train_episode(env, agent):
-    if hasattr(agent, "state_sequence"):
-        agent.state_sequence.clear()
-
-    state = env.reset()
-    done = False
-    total_reward = 0.0
-
-    while not done:
-        action = agent.select_action(state, is_training=True)
-        next_state, reward, done, _ = env.step(action)
-
-        agent.store_transition(state, action, reward, next_state, done)
-        agent.train_step()
-
-        state = next_state
-        total_reward += float(reward)
-
-    stats = env.get_episode_stats()
-    return {
-        "reward": float(total_reward),
-        "ho_attempted": int(stats["ho_attempted"]),
-        "ho_success": int(stats["ho_success"]),
-        "ho_failed": int(stats["ho_failed"]),
-        "pingpong": int(stats["pingpong"]),
-        "weak_signal_event": int(stats["weak_signal_event"]),
-        "hfr": float(stats["hfr"]),
-        "ppr": float(stats["ppr"]),
-        "ehr": float(stats["ehr"]),
-    }
-
-
-def summarize_seed(df, scenario, model_name, model_tag, seed):
-    total_attempted = int(df["ho_attempted"].sum())
-    total_success = int(df["ho_success"].sum())
-    total_failed = int(df["ho_failed"].sum())
-    total_pingpong = int(df["pingpong"].sum())
-    total_weak_signal = int(df["weak_signal_event"].sum())
-
-    agg_hfr = total_failed / max(total_attempted, 1)
-    agg_ppr = total_pingpong / max(total_attempted, 1)
-    agg_ehr = 1.0 - agg_hfr - agg_ppr
-
-    tail_n = min(100, len(df))
-    tail_df = df.tail(tail_n)
-
-    return {
-        "scenario": scenario,
-        "model": model_name,
-        "model_tag": model_tag,
-        "seed": int(seed),
-        "episodes": int(len(df)),
-        "mean_reward": float(df["reward"].mean()),
-        "mean_hfr": float(df["hfr"].mean()),
-        "mean_ppr": float(df["ppr"].mean()),
-        "mean_ehr": float(df["ehr"].mean()),
-        "tail100_reward": float(tail_df["reward"].mean()),
-        "tail100_hfr": float(tail_df["hfr"].mean()),
-        "tail100_ppr": float(tail_df["ppr"].mean()),
-        "tail100_ehr": float(tail_df["ehr"].mean()),
-        "aggregate_hfr": float(agg_hfr),
-        "aggregate_ppr": float(agg_ppr),
-        "aggregate_ehr": float(agg_ehr),
-        "total_ho_attempted": total_attempted,
-        "total_ho_success": total_success,
-        "total_ho_failed": total_failed,
-        "total_pingpong": total_pingpong,
-        "total_weak_signal_event": total_weak_signal,
-    }
-
-
-def summarize_model(seed_summary_df, scenario, model_name, model_tag):
-    total_attempted = int(seed_summary_df["total_ho_attempted"].sum())
-    total_failed = int(seed_summary_df["total_ho_failed"].sum())
-    total_pingpong = int(seed_summary_df["total_pingpong"].sum())
-
-    agg_hfr = total_failed / max(total_attempted, 1)
-    agg_ppr = total_pingpong / max(total_attempted, 1)
-    agg_ehr = 1.0 - agg_hfr - agg_ppr
-
-    return {
-        "scenario": scenario,
-        "model": model_name,
-        "model_tag": model_tag,
-        "n_seeds": int(len(seed_summary_df)),
-        "episodes_per_seed": int(seed_summary_df["episodes"].iloc[0]),
-        "mean_reward": float(seed_summary_df["mean_reward"].mean()),
-        "mean_hfr": float(seed_summary_df["mean_hfr"].mean()),
-        "mean_ppr": float(seed_summary_df["mean_ppr"].mean()),
-        "mean_ehr": float(seed_summary_df["mean_ehr"].mean()),
-        "tail100_reward": float(seed_summary_df["tail100_reward"].mean()),
-        "tail100_hfr": float(seed_summary_df["tail100_hfr"].mean()),
-        "tail100_ppr": float(seed_summary_df["tail100_ppr"].mean()),
-        "tail100_ehr": float(seed_summary_df["tail100_ehr"].mean()),
-        "aggregate_hfr": float(agg_hfr),
-        "aggregate_ppr": float(agg_ppr),
-        "aggregate_ehr": float(agg_ehr),
-        "total_ho_attempted": total_attempted,
-        "total_ho_failed": total_failed,
-        "total_pingpong": total_pingpong,
-    }
 
 
 def main():
     args = parse_args()
     seeds = parse_seeds(args.seeds)
 
-    out_dir = os.path.join("Result", "highway", "train")
-    model_dir = os.path.join(out_dir, "models")
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(model_dir, exist_ok=True)
-
-    run_meta = {
-        "scenario": SCENARIO,
-        "episodes": int(args.episodes),
-        "seeds": seeds,
-        "episode_steps": int(config.EPISODE_STEPS),
-        "sim_step_seconds": float(config.SIM_STEP_SECONDS),
-    }
-    with open(os.path.join(out_dir, "run_config.json"), "w", encoding="utf-8") as f:
-        json.dump(run_meta, f, indent=2)
-
-    all_seed_rows = []
-    all_model_rows = []
-
-    for model_name, model_tag, agent_cls in MODEL_SPECS:
-        print(f"[Train][{SCENARIO}] model={model_name}")
-        model_seed_rows = []
-
-        for seed in seeds:
-            set_global_seed(seed)
-
-            env = VehicleEnv(scenario=SCENARIO)
-            agent = agent_cls()
-
-            episode_rows = []
-            for ep in range(1, args.episodes + 1):
-                row = run_train_episode(env, agent)
-                row["episode"] = ep
-                episode_rows.append(row)
-
-                if ep % config.TARGET_UPDATE_INTERVAL == 0:
-                    agent.update_target_network()
-
-                if ep % 200 == 0 or ep == 1 or ep == args.episodes:
-                    print(
-                        f"  seed={seed} ep={ep}/{args.episodes} "
-                        f"reward={row['reward']:.3f} hfr={row['hfr']:.4f} "
-                        f"ppr={row['ppr']:.4f} ehr={row['ehr']:.4f}"
-                    )
-
-            ep_df = pd.DataFrame(episode_rows).sort_values("episode").reset_index(drop=True)
-            ep_path = os.path.join(out_dir, f"{model_tag}_seed{seed}.csv")
-            ep_df.to_csv(ep_path, index=False)
-
-            model_path = os.path.join(model_dir, f"{model_tag}_seed{seed}.pt")
-            agent.save_model(model_path)
-
-            seed_row = summarize_seed(ep_df, SCENARIO, model_name, model_tag, seed)
-            model_seed_rows.append(seed_row)
-            all_seed_rows.append(seed_row)
-
-            print(
-                f"  saved seed={seed} -> {ep_path}, "
-                f"aggregate_hfr={seed_row['aggregate_hfr']:.4f}, "
-                f"aggregate_ppr={seed_row['aggregate_ppr']:.4f}, "
-                f"aggregate_ehr={seed_row['aggregate_ehr']:.4f}"
-            )
-
-        model_seed_df = pd.DataFrame(model_seed_rows)
-        model_summary_row = summarize_model(model_seed_df, SCENARIO, model_name, model_tag)
-        all_model_rows.append(model_summary_row)
-
-    seed_summary_df = pd.DataFrame(all_seed_rows)
-    seed_summary_df.to_csv(os.path.join(out_dir, "seed_summary.csv"), index=False)
-
-    model_summary_df = pd.DataFrame(all_model_rows)
-    model_summary_df.to_csv(os.path.join(out_dir, "model_summary.csv"), index=False)
-
-    print(f"Saved: {os.path.join(out_dir, 'seed_summary.csv')}")
-    print(f"Saved: {os.path.join(out_dir, 'model_summary.csv')}")
+    train_core = load_train_core()
+    train_core.run_training(
+        scenario="Highway",
+        seeds=seeds,
+        episodes=int(args.episodes),
+        output_dir=os.path.join("Result", "highway", "train"),
+    )
 
 
 if __name__ == "__main__":
     main()
 
 
+
 ##02_train_urban.py
 import argparse
-import json
+import importlib.util
 import os
-import random
-
-import numpy as np
-import pandas as pd
-import torch
 
 import config
-from dqn_agent import DQNAgent
-from lstm_dqn_agent import LSTMDQNAgent
-from vehicle_env import VehicleEnv
 
 
-SCENARIO = "Urban"
-MODEL_SPECS = [
-    ("DQN (MLP)", "DQN_MLP", DQNAgent),
-    ("DRQN (LSTM)", "DRQN_LSTM", LSTMDQNAgent),
-]
+def load_train_core():
+    path = os.path.join(os.path.dirname(__file__), "02_main.py")
+    spec = importlib.util.spec_from_file_location("train_core_02_main", path)
+    module = importlib.util.module_from_spec(spec)
+    if spec.loader is None:
+        raise RuntimeError("Failed to load 02_main.py")
+    spec.loader.exec_module(module)
+    return module
 
 
 def parse_args():
@@ -977,211 +1429,30 @@ def parse_args():
     return parser.parse_args()
 
 
-def set_global_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
 def parse_seeds(seed_str):
     return [int(x.strip()) for x in seed_str.split(",") if x.strip()]
-
-
-def run_train_episode(env, agent):
-    if hasattr(agent, "state_sequence"):
-        agent.state_sequence.clear()
-
-    state = env.reset()
-    done = False
-    total_reward = 0.0
-
-    while not done:
-        action = agent.select_action(state, is_training=True)
-        next_state, reward, done, _ = env.step(action)
-
-        agent.store_transition(state, action, reward, next_state, done)
-        agent.train_step()
-
-        state = next_state
-        total_reward += float(reward)
-
-    stats = env.get_episode_stats()
-    return {
-        "reward": float(total_reward),
-        "ho_attempted": int(stats["ho_attempted"]),
-        "ho_success": int(stats["ho_success"]),
-        "ho_failed": int(stats["ho_failed"]),
-        "pingpong": int(stats["pingpong"]),
-        "weak_signal_event": int(stats["weak_signal_event"]),
-        "hfr": float(stats["hfr"]),
-        "ppr": float(stats["ppr"]),
-        "ehr": float(stats["ehr"]),
-    }
-
-
-def summarize_seed(df, scenario, model_name, model_tag, seed):
-    total_attempted = int(df["ho_attempted"].sum())
-    total_success = int(df["ho_success"].sum())
-    total_failed = int(df["ho_failed"].sum())
-    total_pingpong = int(df["pingpong"].sum())
-    total_weak_signal = int(df["weak_signal_event"].sum())
-
-    agg_hfr = total_failed / max(total_attempted, 1)
-    agg_ppr = total_pingpong / max(total_attempted, 1)
-    agg_ehr = 1.0 - agg_hfr - agg_ppr
-
-    tail_n = min(100, len(df))
-    tail_df = df.tail(tail_n)
-
-    return {
-        "scenario": scenario,
-        "model": model_name,
-        "model_tag": model_tag,
-        "seed": int(seed),
-        "episodes": int(len(df)),
-        "mean_reward": float(df["reward"].mean()),
-        "mean_hfr": float(df["hfr"].mean()),
-        "mean_ppr": float(df["ppr"].mean()),
-        "mean_ehr": float(df["ehr"].mean()),
-        "tail100_reward": float(tail_df["reward"].mean()),
-        "tail100_hfr": float(tail_df["hfr"].mean()),
-        "tail100_ppr": float(tail_df["ppr"].mean()),
-        "tail100_ehr": float(tail_df["ehr"].mean()),
-        "aggregate_hfr": float(agg_hfr),
-        "aggregate_ppr": float(agg_ppr),
-        "aggregate_ehr": float(agg_ehr),
-        "total_ho_attempted": total_attempted,
-        "total_ho_success": total_success,
-        "total_ho_failed": total_failed,
-        "total_pingpong": total_pingpong,
-        "total_weak_signal_event": total_weak_signal,
-    }
-
-
-def summarize_model(seed_summary_df, scenario, model_name, model_tag):
-    total_attempted = int(seed_summary_df["total_ho_attempted"].sum())
-    total_failed = int(seed_summary_df["total_ho_failed"].sum())
-    total_pingpong = int(seed_summary_df["total_pingpong"].sum())
-
-    agg_hfr = total_failed / max(total_attempted, 1)
-    agg_ppr = total_pingpong / max(total_attempted, 1)
-    agg_ehr = 1.0 - agg_hfr - agg_ppr
-
-    return {
-        "scenario": scenario,
-        "model": model_name,
-        "model_tag": model_tag,
-        "n_seeds": int(len(seed_summary_df)),
-        "episodes_per_seed": int(seed_summary_df["episodes"].iloc[0]),
-        "mean_reward": float(seed_summary_df["mean_reward"].mean()),
-        "mean_hfr": float(seed_summary_df["mean_hfr"].mean()),
-        "mean_ppr": float(seed_summary_df["mean_ppr"].mean()),
-        "mean_ehr": float(seed_summary_df["mean_ehr"].mean()),
-        "tail100_reward": float(seed_summary_df["tail100_reward"].mean()),
-        "tail100_hfr": float(seed_summary_df["tail100_hfr"].mean()),
-        "tail100_ppr": float(seed_summary_df["tail100_ppr"].mean()),
-        "tail100_ehr": float(seed_summary_df["tail100_ehr"].mean()),
-        "aggregate_hfr": float(agg_hfr),
-        "aggregate_ppr": float(agg_ppr),
-        "aggregate_ehr": float(agg_ehr),
-        "total_ho_attempted": total_attempted,
-        "total_ho_failed": total_failed,
-        "total_pingpong": total_pingpong,
-    }
 
 
 def main():
     args = parse_args()
     seeds = parse_seeds(args.seeds)
 
-    out_dir = os.path.join("Result", "urban", "train")
-    model_dir = os.path.join(out_dir, "models")
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(model_dir, exist_ok=True)
-
-    run_meta = {
-        "scenario": SCENARIO,
-        "episodes": int(args.episodes),
-        "seeds": seeds,
-        "episode_steps": int(config.EPISODE_STEPS),
-        "sim_step_seconds": float(config.SIM_STEP_SECONDS),
-    }
-    with open(os.path.join(out_dir, "run_config.json"), "w", encoding="utf-8") as f:
-        json.dump(run_meta, f, indent=2)
-
-    all_seed_rows = []
-    all_model_rows = []
-
-    for model_name, model_tag, agent_cls in MODEL_SPECS:
-        print(f"[Train][{SCENARIO}] model={model_name}")
-        model_seed_rows = []
-
-        for seed in seeds:
-            set_global_seed(seed)
-
-            env = VehicleEnv(scenario=SCENARIO)
-            agent = agent_cls()
-
-            episode_rows = []
-            for ep in range(1, args.episodes + 1):
-                row = run_train_episode(env, agent)
-                row["episode"] = ep
-                episode_rows.append(row)
-
-                if ep % config.TARGET_UPDATE_INTERVAL == 0:
-                    agent.update_target_network()
-
-                if ep % 200 == 0 or ep == 1 or ep == args.episodes:
-                    print(
-                        f"  seed={seed} ep={ep}/{args.episodes} "
-                        f"reward={row['reward']:.3f} hfr={row['hfr']:.4f} "
-                        f"ppr={row['ppr']:.4f} ehr={row['ehr']:.4f}"
-                    )
-
-            ep_df = pd.DataFrame(episode_rows).sort_values("episode").reset_index(drop=True)
-            ep_path = os.path.join(out_dir, f"{model_tag}_seed{seed}.csv")
-            ep_df.to_csv(ep_path, index=False)
-
-            model_path = os.path.join(model_dir, f"{model_tag}_seed{seed}.pt")
-            agent.save_model(model_path)
-
-            seed_row = summarize_seed(ep_df, SCENARIO, model_name, model_tag, seed)
-            model_seed_rows.append(seed_row)
-            all_seed_rows.append(seed_row)
-
-            print(
-                f"  saved seed={seed} -> {ep_path}, "
-                f"aggregate_hfr={seed_row['aggregate_hfr']:.4f}, "
-                f"aggregate_ppr={seed_row['aggregate_ppr']:.4f}, "
-                f"aggregate_ehr={seed_row['aggregate_ehr']:.4f}"
-            )
-
-        model_seed_df = pd.DataFrame(model_seed_rows)
-        model_summary_row = summarize_model(model_seed_df, SCENARIO, model_name, model_tag)
-        all_model_rows.append(model_summary_row)
-
-    seed_summary_df = pd.DataFrame(all_seed_rows)
-    seed_summary_df.to_csv(os.path.join(out_dir, "seed_summary.csv"), index=False)
-
-    model_summary_df = pd.DataFrame(all_model_rows)
-    model_summary_df.to_csv(os.path.join(out_dir, "model_summary.csv"), index=False)
-
-    print(f"Saved: {os.path.join(out_dir, 'seed_summary.csv')}")
-    print(f"Saved: {os.path.join(out_dir, 'model_summary.csv')}")
+    train_core = load_train_core()
+    train_core.run_training(
+        scenario="Urban",
+        seeds=seeds,
+        episodes=int(args.episodes),
+        output_dir=os.path.join("Result", "urban", "train"),
+    )
 
 
 if __name__ == "__main__":
     main()
 
 
+
 ##03_plot_paper_figures.py
 import argparse
-import glob
 import json
 import os
 
@@ -1191,9 +1462,21 @@ import pandas as pd
 
 
 MODEL_SPECS = [
-    ("DQN (MLP)", "DQN_MLP", "tab:blue"),
-    ("DRQN (LSTM)", "DRQN_LSTM", "tab:orange"),
+    {
+        "label": "DQN (MLP)",
+        "summary_aliases": ["DQN (MLP)"],
+        "file_tags": ["DQN_MLP"],
+        "color": "red",
+    },
+    {
+        "label": "LSTM-DQN",
+        "summary_aliases": ["LSTM-DQN", "DRQN (LSTM)"],
+        "file_tags": ["LSTM_DQN", "DRQN_LSTM"],
+        "color": "blue",
+    },
 ]
+
+BASELINE_COLOR = "gray"
 
 
 def parse_args():
@@ -1210,40 +1493,25 @@ def parse_args():
 
 
 def moving_average(x, window):
-    x = np.asarray(x, dtype=float)
-    if x.size == 0:
-        return x
-    window = int(max(1, min(window, x.size)))
-    kernel = np.ones(window, dtype=float) / window
-    return np.convolve(x, kernel, mode="same")
+    series = pd.Series(np.asarray(x, dtype=float))
+    if series.empty:
+        return series.to_numpy(dtype=float)
+    window = int(max(1, min(window, len(series))))
+    # Keep NaN semantics: windows with no valid KPI values remain NaN.
+    return series.rolling(window=window, min_periods=1).mean().to_numpy(dtype=float)
 
 
-def load_curves(train_dir, model_tag, metric):
-    paths = sorted(glob.glob(os.path.join(train_dir, f"{model_tag}_seed*.csv")))
-    if not paths:
-        return np.array([]), []
-
-    curves = []
-    for p in paths:
-        df = pd.read_csv(p)
-        if metric not in df.columns:
-            continue
-        curves.append(df[metric].to_numpy(dtype=float))
-
-    if not curves:
-        return np.array([]), paths
-
-    min_len = min(len(c) for c in curves)
-    arr = np.array([c[:min_len] for c in curves], dtype=float)
-    mean_curve = np.mean(arr, axis=0)
-    return mean_curve, paths
+def load_model_eval_trend(train_dir):
+    path = os.path.join(train_dir, "model_eval_trend.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing evaluation trend file: {path}")
+    return pd.read_csv(path)
 
 
 def load_baseline(baseline_dir):
     path = os.path.join(baseline_dir, "best_baseline.json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing baseline file: {path}")
-
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -1255,153 +1523,76 @@ def load_model_summary(train_dir):
     return pd.read_csv(path)
 
 
-def plot_reward_curve(fig_dir, scenario_title, baseline, reward_curves, smooth_window):
+def _get_model_row(model_summary_df, aliases):
+    for alias in aliases:
+        rows = model_summary_df[model_summary_df["model"] == alias]
+        if not rows.empty:
+            return rows.iloc[0]
+    raise ValueError(f"No model row found for aliases: {aliases}")
+
+
+def plot_trend(fig_dir, file_name, title, ylabel, x_curves, y_curves, baseline_value, smooth_window):
     plt.figure(figsize=(10, 5))
 
-    for model_name, _, color in MODEL_SPECS:
-        curve = reward_curves.get(model_name, np.array([]))
+    for spec in MODEL_SPECS:
+        x = x_curves.get(spec["label"], np.array([]))
+        curve = y_curves.get(spec["label"], np.array([]))
         if curve.size == 0:
             continue
         smooth = moving_average(curve, smooth_window)
+        plt.plot(x, smooth, color=spec["color"], linewidth=2.0, label=spec["label"])
 
-        x = np.arange(1, len(curve) + 1)
-        plt.plot(x, curve, color=color, alpha=0.20, linewidth=1.0)
-        plt.plot(x, smooth, color=color, linewidth=2.0, label=model_name)
-
-    baseline_reward = float(baseline["mean_reward"])
     plt.axhline(
-        baseline_reward,
-        color="gray",
+        float(baseline_value),
+        color=BASELINE_COLOR,
         linestyle="--",
         linewidth=1.8,
-        label="Best Fixed Baseline",
+        label="Fixed Baseline",
     )
 
-    plt.title(f"{scenario_title}: Reward Curve (Absolute)")
-    plt.xlabel("Episode")
-    plt.ylabel("Reward")
+    plt.title(title)
+    plt.xlabel("Episode Index")
+    plt.ylabel(ylabel)
     plt.grid(True, alpha=0.3)
     plt.legend(loc="best")
     plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, "fig1_reward_curve.png"), dpi=300)
+    plt.savefig(os.path.join(fig_dir, file_name), dpi=300)
     plt.close()
 
 
-def plot_hfr_ppr(fig_dir, scenario_title, baseline, hfr_curves, ppr_curves, smooth_window):
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+def plot_metric_bar(fig_dir, file_name, title, metric_name, baseline_value, model_summary_df):
+    methods = ["Best Fixed Baseline", "DQN (MLP)", "LSTM-DQN"]
 
-    for model_name, _, color in MODEL_SPECS:
-        hfr = hfr_curves.get(model_name, np.array([]))
-        ppr = ppr_curves.get(model_name, np.array([]))
+    dqn_row = _get_model_row(model_summary_df, ["DQN (MLP)"])
+    lstm_row = _get_model_row(model_summary_df, ["LSTM-DQN", "DRQN (LSTM)"])
 
-        if hfr.size > 0:
-            axes[0].plot(np.arange(1, len(hfr) + 1), moving_average(hfr, smooth_window), color=color, linewidth=2.0, label=model_name)
-        if ppr.size > 0:
-            axes[1].plot(np.arange(1, len(ppr) + 1), moving_average(ppr, smooth_window), color=color, linewidth=2.0, label=model_name)
+    values = [
+        float(baseline_value),
+        float(dqn_row[metric_name]),
+        float(lstm_row[metric_name]),
+    ]
 
-    axes[0].axhline(float(baseline["aggregate_hfr"]), color="gray", linestyle="--", linewidth=1.6, label="Best Fixed Baseline")
-    axes[1].axhline(float(baseline["aggregate_ppr"]), color="gray", linestyle="--", linewidth=1.6, label="Best Fixed Baseline")
+    colors = ["#888888", "red", "blue"]
 
-    axes[0].set_title(f"{scenario_title}: HFR Trend")
-    axes[1].set_title(f"{scenario_title}: PPR Trend")
-    axes[0].set_ylabel("HFR")
-    axes[1].set_ylabel("PPR")
-    axes[1].set_xlabel("Episode")
+    plt.figure(figsize=(7, 5))
+    bars = plt.bar(methods, values, color=colors, edgecolor="black", linewidth=0.6)
 
-    for ax in axes:
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, "fig2_hfr_ppr_trend.png"), dpi=300)
-    plt.close(fig)
-
-
-def plot_ehr(fig_dir, scenario_title, baseline, ehr_curves, smooth_window):
-    plt.figure(figsize=(10, 5))
-
-    for model_name, _, color in MODEL_SPECS:
-        curve = ehr_curves.get(model_name, np.array([]))
-        if curve.size == 0:
-            continue
-        plt.plot(
-            np.arange(1, len(curve) + 1),
-            moving_average(curve, smooth_window),
-            color=color,
-            linewidth=2.0,
-            label=model_name,
+    offset = max(values) * 0.01 if max(values) > 0 else 0.01
+    for bar, value in zip(bars, values):
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            value + offset,
+            f"{value:.4f}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
         )
 
-    plt.axhline(
-        float(baseline["aggregate_ehr"]),
-        color="gray",
-        linestyle="--",
-        linewidth=1.8,
-        label="Best Fixed Baseline",
-    )
-
-    plt.title(f"{scenario_title}: EHR Trend")
-    plt.xlabel("Episode")
-    plt.ylabel("EHR")
-    plt.grid(True, alpha=0.3)
-    plt.legend(loc="best")
-    plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, "fig3_ehr_trend.png"), dpi=300)
-    plt.close()
-
-
-def _get_model_row(model_summary_df, model_name):
-    rows = model_summary_df[model_summary_df["model"] == model_name]
-    if rows.empty:
-        raise ValueError(f"Model '{model_name}' not found in model_summary.csv")
-    return rows.iloc[0]
-
-
-def plot_final_bar(fig_dir, baseline, model_summary_df, scenario_title):
-    methods = ["Best Fixed Baseline", "DQN (MLP)", "DRQN (LSTM)"]
-    metrics = ["HFR", "PPR", "EHR", "Reward"]
-
-    dqn_row = _get_model_row(model_summary_df, "DQN (MLP)")
-    drqn_row = _get_model_row(model_summary_df, "DRQN (LSTM)")
-
-    values = {
-        "Best Fixed Baseline": [
-            float(baseline["aggregate_hfr"]),
-            float(baseline["aggregate_ppr"]),
-            float(baseline["aggregate_ehr"]),
-            float(baseline["mean_reward"]),
-        ],
-        "DQN (MLP)": [
-            float(dqn_row["aggregate_hfr"]),
-            float(dqn_row["aggregate_ppr"]),
-            float(dqn_row["aggregate_ehr"]),
-            float(dqn_row["mean_reward"]),
-        ],
-        "DRQN (LSTM)": [
-            float(drqn_row["aggregate_hfr"]),
-            float(drqn_row["aggregate_ppr"]),
-            float(drqn_row["aggregate_ehr"]),
-            float(drqn_row["mean_reward"]),
-        ],
-    }
-
-    x = np.arange(len(metrics), dtype=float)
-    width = 0.25
-
-    plt.figure(figsize=(10, 5))
-    colors = ["#888888", "tab:blue", "tab:orange"]
-
-    for i, method in enumerate(methods):
-        y = values[method]
-        plt.bar(x + (i - 1) * width, y, width=width, label=method, color=colors[i], edgecolor="black", linewidth=0.6)
-
-    plt.xticks(x, metrics)
-    plt.title(f"{scenario_title}: Final KPI/Reward Comparison")
-    plt.ylabel("Value")
+    plt.title(title)
+    plt.ylabel(metric_name.replace("aggregate_", "").upper())
     plt.grid(axis="y", alpha=0.3)
-    plt.legend(loc="best")
     plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, "fig4_final_bar_chart.png"), dpi=300)
+    plt.savefig(os.path.join(fig_dir, file_name), dpi=300)
     plt.close()
 
 
@@ -1419,39 +1610,108 @@ def main():
 
     baseline = load_baseline(baseline_dir)
     model_summary_df = load_model_summary(train_dir)
+    eval_trend_df = load_model_eval_trend(train_dir)
 
     reward_curves = {}
     hfr_curves = {}
     ppr_curves = {}
     ehr_curves = {}
+    x_curves = {}
 
-    for model_name, model_tag, _ in MODEL_SPECS:
-        reward_curve, paths = load_curves(train_dir, model_tag, "reward")
-        hfr_curve, _ = load_curves(train_dir, model_tag, "hfr")
-        ppr_curve, _ = load_curves(train_dir, model_tag, "ppr")
-        ehr_curve, _ = load_curves(train_dir, model_tag, "ehr")
+    for spec in MODEL_SPECS:
+        rows = pd.DataFrame()
+        for alias in spec["summary_aliases"]:
+            candidate = eval_trend_df[eval_trend_df["model"] == alias]
+            if not candidate.empty:
+                rows = candidate
+                break
 
-        if len(paths) == 0:
-            raise FileNotFoundError(
-                f"No per-seed training files found for {model_name} in {train_dir}. "
-                f"Expected files like {model_tag}_seed*.csv"
+        if rows.empty:
+            raise ValueError(
+                f"No eval trend rows found for {spec['label']} in model_eval_trend.csv"
             )
+        rows = rows.sort_values("checkpoint_episode")
 
-        reward_curves[model_name] = reward_curve
-        hfr_curves[model_name] = hfr_curve
-        ppr_curves[model_name] = ppr_curve
-        ehr_curves[model_name] = ehr_curve
+        x_curves[spec["label"]] = rows["checkpoint_episode"].to_numpy(dtype=float)
+        reward_curves[spec["label"]] = rows["reward"].to_numpy(dtype=float)
+        hfr_curves[spec["label"]] = rows["hfr"].to_numpy(dtype=float)
+        ppr_curves[spec["label"]] = rows["ppr"].to_numpy(dtype=float)
+        ehr_curves[spec["label"]] = rows["ehr"].to_numpy(dtype=float)
 
-    plot_reward_curve(fig_dir, scenario_title, baseline, reward_curves, args.smooth_window)
-    plot_hfr_ppr(fig_dir, scenario_title, baseline, hfr_curves, ppr_curves, args.smooth_window)
-    plot_ehr(fig_dir, scenario_title, baseline, ehr_curves, args.smooth_window)
-    plot_final_bar(fig_dir, baseline, model_summary_df, scenario_title)
+    plot_trend(
+        fig_dir=fig_dir,
+        file_name="fig_reward_trend.png",
+        title=f"{scenario_title} Reward Trend",
+        ylabel="Reward",
+        x_curves=x_curves,
+        y_curves=reward_curves,
+        baseline_value=float(baseline["mean_reward"]),
+        smooth_window=args.smooth_window,
+    )
+    plot_trend(
+        fig_dir=fig_dir,
+        file_name="fig_hfr_trend.png",
+        title=f"{scenario_title} HFR Trend (no-attempt episodes excluded)",
+        ylabel="HFR",
+        x_curves=x_curves,
+        y_curves=hfr_curves,
+        baseline_value=float(baseline["aggregate_hfr"]),
+        smooth_window=args.smooth_window,
+    )
+    plot_trend(
+        fig_dir=fig_dir,
+        file_name="fig_ppr_trend.png",
+        title=f"{scenario_title} PPR Trend (no-attempt episodes excluded)",
+        ylabel="PPR",
+        x_curves=x_curves,
+        y_curves=ppr_curves,
+        baseline_value=float(baseline["aggregate_ppr"]),
+        smooth_window=args.smooth_window,
+    )
+    plot_trend(
+        fig_dir=fig_dir,
+        file_name="fig_ehr_trend.png",
+        title=f"{scenario_title} EHR Trend (no-attempt episodes excluded)",
+        ylabel="EHR",
+        x_curves=x_curves,
+        y_curves=ehr_curves,
+        baseline_value=float(baseline["aggregate_ehr"]),
+        smooth_window=args.smooth_window,
+    )
+
+    plot_metric_bar(
+        fig_dir=fig_dir,
+        file_name="fig_hfr_bar.png",
+        title=f"{scenario_title} Final HFR Comparison",
+        metric_name="aggregate_hfr",
+        baseline_value=float(baseline["aggregate_hfr"]),
+        model_summary_df=model_summary_df,
+    )
+    plot_metric_bar(
+        fig_dir=fig_dir,
+        file_name="fig_ppr_bar.png",
+        title=f"{scenario_title} Final PPR Comparison",
+        metric_name="aggregate_ppr",
+        baseline_value=float(baseline["aggregate_ppr"]),
+        model_summary_df=model_summary_df,
+    )
+    plot_metric_bar(
+        fig_dir=fig_dir,
+        file_name="fig_ehr_bar.png",
+        title=f"{scenario_title} Final EHR Comparison",
+        metric_name="aggregate_ehr",
+        baseline_value=float(baseline["aggregate_ehr"]),
+        model_summary_df=model_summary_df,
+    )
 
     print(f"Saved figures to: {fig_dir}")
-    print("- fig1_reward_curve.png")
-    print("- fig2_hfr_ppr_trend.png")
-    print("- fig3_ehr_trend.png")
-    print("- fig4_final_bar_chart.png")
+    print("- fig_reward_trend.png")
+    print("- fig_hfr_trend.png")
+    print("- fig_ppr_trend.png")
+    print("- fig_ehr_trend.png")
+    print("- fig_hfr_bar.png")
+    print("- fig_ppr_bar.png")
+    print("- fig_ehr_bar.png")
 
 
 if __name__ == "__main__":
