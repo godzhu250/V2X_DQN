@@ -6,8 +6,8 @@
 # Valid values: "Highway" or "Urban"
 SCENARIO = "Highway"
 
-SIM_STEP_SECONDS = 0.1
-EPISODE_STEPS = 500
+SIM_STEP_SECONDS = 0.1 # 每个仿真步骤的时间长度（秒）
+EPISODE_STEPS = 500    # 每个episode的最大步骤数（50秒）
 
 SCENARIO_PROFILES = {
     "Highway": {
@@ -69,7 +69,7 @@ EPSILON_END = 0.05
 EPSILON_DECAY = 0.997
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY = 350000 # 会在350000/500=700个episode内探索率从1.0衰减到0.05
+EPS_DECAY = 500000 # 会在450000/500=1000个episode内探索率从1.0衰减到0.05
 
 TARGET_UPDATE_INTERVAL = 10
 TRAIN_FREQ = 4
@@ -103,10 +103,10 @@ STAGNATION_DECAY_EPISODES = 600
 # Experiment defaults
 # ============================================================
 HIGHWAY_SEEDS = [71, 123, 456]
-HIGHWAY_EPISODES = 3000
+HIGHWAY_EPISODES = 5000
 
 URBAN_SEEDS = [71, 123, 456]
-URBAN_EPISODES = 3000
+URBAN_EPISODES = 5000
 
 BASELINE_EVAL_EPISODES = 200
 BASELINE_SEED = 250
